@@ -65,6 +65,9 @@ WS  /ws
 | `TURN_PASSWORD` | `replace-with-turn-password` | TURN password. Должен совпадать с coturn config/compose. |
 | `TURN_REALM` | `media.example.com` | TURN realm для coturn. |
 
+| `TURN_MIN_PORT` | `50000` | Lower UDP relay port for coturn. |
+| `TURN_MAX_PORT` | `50100` | Upper UDP relay port for coturn. |
+
 ## Production ports
 
 На media server должны быть открыты:
@@ -73,7 +76,7 @@ WS  /ws
 4000/tcp                 signaling HTTP/WebSocket
 40000-40100/udp,tcp      mediasoup WebRTC
 3478/tcp,udp             TURN
-50000-50100/udp          TURN relay range
+50000-50100/udp          TURN relay range, or TURN_MIN_PORT-TURN_MAX_PORT
 ```
 
 Внешний edge на app server должен проксировать:

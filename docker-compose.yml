@@ -62,6 +62,8 @@ services:
       - /etc/coturn/turnserver.conf
       - --user=${TURN_USERNAME:?TURN_USERNAME is required}:${TURN_PASSWORD:?TURN_PASSWORD is required}
       - --realm=${TURN_REALM:?TURN_REALM is required}
+      - --min-port=${TURN_MIN_PORT:-50000}
+      - --max-port=${TURN_MAX_PORT:-50100}
     ports:
       - "${TURN_BIND_ADDR:-0.0.0.0}:3478:3478/udp"
       - "${TURN_BIND_ADDR:-0.0.0.0}:3478:3478/tcp"
