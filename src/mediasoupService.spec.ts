@@ -37,6 +37,7 @@ let transportCounter = 0;
 let producerCounter = 0;
 let consumerCounter = 0;
 let fakeAudioLevelObservers: FakeAudioLevelObserver[] = [];
+let fakeAudioLevelObserverOptions: Array<Record<string, unknown>> = [];
 
 function createFakeWorker() {
   const worker = new EventEmitter() as EventEmitter & {
@@ -56,7 +57,10 @@ function createFakeRouter() {
   return {
     rtpCapabilities: {},
     canConsume: () => true,
-    createAudioLevelObserver: async () => createFakeAudioLevelObserver(),
+    createAudioLevelObserver: async (options: Record<string, unknown>) => {
+      fakeAudioLevelObserverOptions.push(options);
+      return createFakeAudioLevelObserver();
+    },
     createWebRtcTransport: async () => createFakeTransport(),
   };
 }
@@ -138,7 +142,20 @@ describe("MediasoupService", () => {
     producerCounter = 0;
     consumerCounter = 0;
     fakeAudioLevelObservers = [];
+    fakeAudioLevelObserverOptions = [];
     createWorker.mockResolvedValue(createFakeWorker());
+  });
+
+  it("configures active speaker detection to ignore quiet background noise", async () => {
+    const service = await createService();
+
+    await service.ensureRoom("room_1");
+
+    expect(fakeAudioLevelObserverOptions[0]).toMatchObject({
+      maxEntries: 1,
+      threshold: -55,
+      interval: 800,
+    });
   });
 
   it("closes consumers for a producer when the producer owner leaves", async () => {

@@ -63,6 +63,9 @@ const mediaCodecs = [
   },
 ];
 
+const ACTIVE_SPEAKER_THRESHOLD_DBOV = -55;
+const ACTIVE_SPEAKER_INTERVAL_MS = 800;
+
 export class MediasoupService {
   private readonly rooms = new Map<string, RuntimeRoom>();
   private workers: Worker[] = [];
@@ -138,8 +141,8 @@ export class MediasoupService {
     const router = await worker.createRouter({ mediaCodecs });
     const audioLevelObserver = await router.createAudioLevelObserver({
       maxEntries: 1,
-      threshold: -70,
-      interval: 800,
+      threshold: ACTIVE_SPEAKER_THRESHOLD_DBOV,
+      interval: ACTIVE_SPEAKER_INTERVAL_MS,
     });
     const room: RuntimeRoom = {
       workerIndex,
