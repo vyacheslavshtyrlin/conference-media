@@ -1,7 +1,9 @@
 import { z } from "zod";
 
 export const MAX_ROOM_PARTICIPANTS = 10;
-export const ROOM_TTL_SECONDS = 30 * 60;
+export const EMPTY_ROOM_TTL_SECONDS = 15 * 60;
+export const CHAT_HISTORY_LIMIT = 500;
+export const CHAT_MESSAGE_TEXT_MAX_LENGTH = 4000;
 
 export const serviceNameSchema = z.enum(["web", "api", "signaling"]);
 
@@ -13,7 +15,8 @@ export const healthStatusSchema = z.object({
 export type ServiceName = z.infer<typeof serviceNameSchema>;
 export type HealthStatus = z.infer<typeof healthStatusSchema>;
 
-export const roomStatusSchema = z.literal("active");
+export const roomStatusSchema = z.enum(["active", "closed"]);
+export const roomExpiresAtSchema = z.string().datetime().nullable();
 
 export const createRoomRequestSchema = z.object({}).strict();
 
@@ -24,13 +27,13 @@ export const createRoomResponseSchema = z.object({
   creatorToken: z.string().min(1),
   mediaNodeId: z.string().min(1),
   signalingUrl: z.string().url(),
-  expiresAt: z.string().datetime(),
+  expiresAt: roomExpiresAtSchema,
 });
 
 export const getRoomResponseSchema = z.object({
   roomId: z.string().min(1),
   slug: z.string().min(1),
-  expiresAt: z.string().datetime(),
+  expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
   mediaNodeId: z.string().min(1),
   signalingUrl: z.string().url(),
@@ -85,9 +88,37 @@ export type MediaKind = z.infer<typeof mediaKindSchema>;
 export type ParticipantMedia = z.infer<typeof participantMediaSchema>;
 export type Participant = z.infer<typeof participantSchema>;
 
+export const userChatMessageSchema = z.object({
+  messageId: z.string().min(1),
+  roomId: z.string().min(1),
+  kind: z.literal("user"),
+  participantId: z.string().min(1),
+  authorName: z.string().min(1),
+  text: z.string().min(1).max(CHAT_MESSAGE_TEXT_MAX_LENGTH),
+  createdAt: z.string().datetime(),
+});
+
+export const systemChatMessageSchema = z.object({
+  messageId: z.string().min(1),
+  roomId: z.string().min(1),
+  kind: z.literal("system"),
+  text: z.string().min(1).max(CHAT_MESSAGE_TEXT_MAX_LENGTH),
+  createdAt: z.string().datetime(),
+});
+
+export const chatMessageSchema = z.discriminatedUnion("kind", [
+  userChatMessageSchema,
+  systemChatMessageSchema,
+]);
+
+export type UserChatMessage = z.infer<typeof userChatMessageSchema>;
+export type SystemChatMessage = z.infer<typeof systemChatMessageSchema>;
+export type ChatMessage = z.infer<typeof chatMessageSchema>;
+
 export const errorCodeSchema = z.enum([
   "ROOM_NOT_FOUND",
   "ROOM_EXPIRED",
+  "ROOM_CLOSED",
   "ROOM_FULL",
   "INVALID_TOKEN",
   "INVALID_PAYLOAD",
@@ -183,6 +214,17 @@ export const roomLeaveRequestEventSchema = z.object({
   requestId: requestIdSchema,
 });
 
+export const roomCloseRequestEventSchema = z.object({
+  type: z.literal("room:close"),
+  requestId: requestIdSchema,
+});
+
+export const chatSendRequestEventSchema = z.object({
+  type: z.literal("chat:send"),
+  requestId: requestIdSchema,
+  text: z.string().trim().min(1).max(CHAT_MESSAGE_TEXT_MAX_LENGTH),
+});
+
 export const clientWebSocketEventSchema = z.discriminatedUnion("type", [
   roomJoinRequestEventSchema,
   getRouterRtpCapabilitiesRequestEventSchema,
@@ -193,6 +235,8 @@ export const clientWebSocketEventSchema = z.discriminatedUnion("type", [
   closeProducerRequestEventSchema,
   setMediaStateRequestEventSchema,
   roomLeaveRequestEventSchema,
+  roomCloseRequestEventSchema,
+  chatSendRequestEventSchema,
 ]);
 
 export type RoomJoinRequestEvent = z.infer<typeof roomJoinRequestEventSchema>;
@@ -210,6 +254,8 @@ export type ConsumeRequestEvent = z.infer<typeof consumeRequestEventSchema>;
 export type CloseProducerRequestEvent = z.infer<typeof closeProducerRequestEventSchema>;
 export type SetMediaStateRequestEvent = z.infer<typeof setMediaStateRequestEventSchema>;
 export type RoomLeaveRequestEvent = z.infer<typeof roomLeaveRequestEventSchema>;
+export type RoomCloseRequestEvent = z.infer<typeof roomCloseRequestEventSchema>;
+export type ChatSendRequestEvent = z.infer<typeof chatSendRequestEventSchema>;
 export type ClientWebSocketEvent = z.infer<typeof clientWebSocketEventSchema>;
 
 export const responseSuccessEventSchema = z.object({
@@ -235,6 +281,7 @@ export const roomSnapshotEventSchema = z.object({
   type: z.literal("room:snapshot"),
   roomId: z.string().min(1),
   participants: z.array(participantSchema),
+  chatMessages: z.array(chatMessageSchema),
 });
 
 export const participantJoinedEventSchema = z.object({
@@ -273,6 +320,22 @@ export const producerClosedEventSchema = z.object({
   source: mediaSourceSchema,
 });
 
+export const roomClosedReasonSchema = z.enum([
+  "closed_by_creator",
+  "empty_timeout",
+  "server_shutdown",
+]);
+
+export const roomClosedEventSchema = z.object({
+  type: z.literal("room:closed"),
+  reason: roomClosedReasonSchema,
+});
+
+export const chatMessageAddedEventSchema = z.object({
+  type: z.literal("chat:messageAdded"),
+  message: chatMessageSchema,
+});
+
 export const serverWebSocketEventSchema = z.union([
   responseEventSchema,
   roomSnapshotEventSchema,
@@ -282,6 +345,8 @@ export const serverWebSocketEventSchema = z.union([
   participantActiveSpeakerChangedEventSchema,
   producerAddedEventSchema,
   producerClosedEventSchema,
+  roomClosedEventSchema,
+  chatMessageAddedEventSchema,
 ]);
 
 export type ResponseSuccessEvent = z.infer<typeof responseSuccessEventSchema>;
@@ -294,6 +359,9 @@ export type ParticipantMediaChangedEvent = z.infer<typeof participantMediaChange
 export type ParticipantActiveSpeakerChangedEvent = z.infer<typeof participantActiveSpeakerChangedEventSchema>;
 export type ProducerAddedEvent = z.infer<typeof producerAddedEventSchema>;
 export type ProducerClosedEvent = z.infer<typeof producerClosedEventSchema>;
+export type RoomClosedReason = z.infer<typeof roomClosedReasonSchema>;
+export type RoomClosedEvent = z.infer<typeof roomClosedEventSchema>;
+export type ChatMessageAddedEvent = z.infer<typeof chatMessageAddedEventSchema>;
 export type ServerWebSocketEvent = z.infer<typeof serverWebSocketEventSchema>;
 
 export const roomMetadataSchema = z.object({
@@ -303,7 +371,7 @@ export const roomMetadataSchema = z.object({
   signalingUrl: z.string().url(),
   creatorTokenHash: z.string().min(1),
   createdAt: z.string().datetime(),
-  expiresAt: z.string().datetime(),
+  expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
 });
 

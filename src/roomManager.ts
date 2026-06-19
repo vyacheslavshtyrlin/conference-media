@@ -1,6 +1,7 @@
-import { MAX_ROOM_PARTICIPANTS } from "#contracts";
-import type { MediaKind, Participant, ParticipantMedia, RoomMetadata } from "#contracts";
+import { CHAT_HISTORY_LIMIT, CHAT_MESSAGE_TEXT_MAX_LENGTH, MAX_ROOM_PARTICIPANTS } from "#contracts";
+import type { ChatMessage, MediaKind, Participant, ParticipantMedia, RoomMetadata } from "#contracts";
 import { Mutex } from "async-mutex";
+import { randomUUID } from "node:crypto";
 
 import { SignalingError } from "./errors.js";
 import type { Logger } from "./logger.js";
@@ -43,10 +44,19 @@ export class RoomManager {
     this.onActiveSpeakerChangedCallback = callback;
   }
 
-  async join(payload: JoinTokenPayload): Promise<{ room: RoomMetadata; participant: Participant; participants: Participant[] }> {
+  async join(payload: JoinTokenPayload): Promise<{
+    room: RoomMetadata;
+    participant: Participant;
+    participants: Participant[];
+    chatMessages: ChatMessage[];
+    joinMessage?: ChatMessage;
+  }> {
     return this.runExclusive(payload.roomId, async () => {
-      const metadata = await this.repository.getRoom(payload.roomId);
+      const roomBeforeJoin = await this.repository.getRoom(payload.roomId);
+      const shouldRestoreEmptyTtl = Boolean(roomBeforeJoin.expiresAt);
+      const metadata = await this.repository.touchActiveRoom(roomBeforeJoin);
       const state = await this.ensureRuntimeRoom(metadata);
+      state.metadata = metadata;
 
       if (!state.peers.getPeer(payload.participantId) && state.peers.count() >= MAX_ROOM_PARTICIPANTS) {
         throw new SignalingError("ROOM_FULL", "Room is full");
@@ -54,23 +64,70 @@ export class RoomManager {
 
       await this.repository.assertRoomCapacity(metadata.roomId, payload.participantId);
 
-      // Guard: reject the join if the room expired between getRoom and here.
-      // saveParticipant would otherwise clamp a negative TTL to 1ms and silently
-      // write a participant record that vanishes immediately.
-      if (new Date(metadata.expiresAt).getTime() <= Date.now()) {
-        throw new SignalingError("ROOM_EXPIRED", "Room has expired");
-      }
-
+      const alreadyJoined = Boolean(state.peers.getPeer(payload.participantId));
       const participant = state.peers.addPeer(payload);
-      await this.repository.saveParticipant(metadata.roomId, metadata.expiresAt, participant);
+      let participantSaved = false;
 
       if (state.cleanupTimer) {
         clearTimeout(state.cleanupTimer);
         state.cleanupTimer = undefined;
       }
 
-      await this.mediasoup.ensureRoom(metadata.roomId);
-      return { room: metadata, participant, participants: state.peers.list() };
+      try {
+        await this.repository.saveParticipant(metadata.roomId, participant);
+        participantSaved = true;
+        await this.mediasoup.ensureRoom(metadata.roomId);
+      } catch (error) {
+        if (!alreadyJoined) {
+          await this.rollbackFailedJoin(
+            metadata.roomId,
+            participant.participantId,
+            state,
+            participantSaved,
+            shouldRestoreEmptyTtl,
+          );
+        }
+        throw error;
+      }
+
+      let chatMessages: ChatMessage[];
+      let joinMessage: ChatMessage | undefined;
+      try {
+        chatMessages = await this.repository.listChatMessages(metadata.roomId);
+        joinMessage = alreadyJoined
+          ? undefined
+          : await this.appendSystemChatMessage(metadata.roomId, `${participant.displayName} подключился к конференции`);
+        if (joinMessage) {
+          chatMessages = [...chatMessages, joinMessage].slice(-CHAT_HISTORY_LIMIT);
+        }
+      } catch (error) {
+        if (!alreadyJoined) {
+          await this.rollbackFailedJoin(
+            metadata.roomId,
+            participant.participantId,
+            state,
+            participantSaved,
+            shouldRestoreEmptyTtl,
+          );
+        }
+        this.logger?.warn("chat initialization failed during room join", {
+          roomId: metadata.roomId,
+          participantId: participant.participantId,
+          error: String(error),
+        });
+        throw new SignalingError(
+          "MEDIASOUP_ERROR",
+          "Room chat is temporarily unavailable. Please refresh and join again.",
+        );
+      }
+
+      return {
+        room: metadata,
+        participant,
+        participants: state.peers.list(),
+        chatMessages,
+        joinMessage,
+      };
     });
   }
 
@@ -86,17 +143,12 @@ export class RoomManager {
     return this.runExclusive(roomId, async () => {
       const state = this.requireRuntimeRoom(roomId);
 
-      // Fix 3: guard against writing to an already-expired room (Math.max clamp would silently set 1ms TTL)
-      if (new Date(state.metadata.expiresAt).getTime() <= Date.now()) {
-        throw new SignalingError("ROOM_EXPIRED", "Room has expired");
-      }
-
       const participant = state.peers.setMedia(participantId, media);
       if (!participant) {
         throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
       }
 
-      await this.repository.saveParticipant(roomId, state.metadata.expiresAt, participant);
+      await this.repository.saveParticipant(roomId, participant);
       return participant;
     });
   }
@@ -152,6 +204,26 @@ export class RoomManager {
     });
   }
 
+  async closeRoomByCreator(roomId: string, participantId: string): Promise<void> {
+    return this.runExclusive(roomId, async () => {
+      const state = this.requireRuntimeRoom(roomId);
+      const participant = state.peers.getPeer(participantId);
+      if (!participant?.isCreator) {
+        throw new SignalingError("INVALID_TOKEN", "Only the room creator can close the room");
+      }
+
+      if (state.cleanupTimer) {
+        clearTimeout(state.cleanupTimer);
+        state.cleanupTimer = undefined;
+      }
+
+      this.mediasoup.closeRoom(roomId);
+      this.rooms.delete(roomId);
+      await this.repository.closeRoom(state.metadata);
+      this.roomLocks.delete(roomId);
+    });
+  }
+
   listProducers(roomId: string) {
     return this.mediasoup.listProducers(roomId);
   }
@@ -160,24 +232,53 @@ export class RoomManager {
     return this.mediasoup.getActiveSpeakerParticipantId(roomId);
   }
 
-  async leave(roomId: string, participantId: string): Promise<Participant | undefined> {
+  async sendChatMessage(roomId: string, participantId: string, text: string): Promise<ChatMessage> {
+    return this.runExclusive(roomId, async () => {
+      const state = this.requireRuntimeRoom(roomId);
+      const participant = state.peers.getPeer(participantId);
+      if (!participant) {
+        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+      }
+
+      const trimmed = text.trim();
+      if (!trimmed || trimmed.length > CHAT_MESSAGE_TEXT_MAX_LENGTH) {
+        throw new SignalingError("INVALID_PAYLOAD", "Chat message text is invalid");
+      }
+
+      return this.repository.appendChatMessage(roomId, {
+        messageId: this.createMessageId(),
+        roomId,
+        kind: "user",
+        participantId: participant.participantId,
+        authorName: participant.displayName,
+        text: trimmed,
+        createdAt: new Date().toISOString(),
+      });
+    });
+  }
+
+  async leave(roomId: string, participantId: string): Promise<{ participant?: Participant; chatMessage?: ChatMessage }> {
     return this.runExclusive(roomId, async () => {
       const state = this.rooms.get(roomId);
       if (!state) {
-        return undefined;
+        return {};
       }
 
       this.mediasoup.closePeer(roomId, participantId);
       const participant = state.peers.removePeer(participantId);
       await this.repository.removeParticipant(roomId, participantId);
+      const chatMessage = participant
+        ? await this.appendSystemChatMessage(roomId, `${participant.displayName} покинул конференцию`)
+        : undefined;
 
       if (state.peers.count() === 0) {
+        state.metadata = await this.repository.markRoomEmpty(state.metadata);
         state.cleanupTimer = setTimeout(() => {
           void this.closeEmptyRoom(roomId);
         }, this.emptyGraceMs);
       }
 
-      return participant;
+      return { participant, chatMessage };
     });
   }
 
@@ -237,6 +338,63 @@ export class RoomManager {
     }
   }
 
+  private appendSystemChatMessage(roomId: string, text: string): Promise<ChatMessage> {
+    return this.repository.appendChatMessage(roomId, {
+      messageId: this.createMessageId(),
+      roomId,
+      kind: "system",
+      text,
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  private createMessageId(): string {
+    return `msg_${randomUUID()}`;
+  }
+
+  private async rollbackFailedJoin(
+    roomId: string,
+    participantId: string,
+    state: RuntimeRoomState,
+    participantSaved: boolean,
+    restoreEmptyTtl: boolean,
+  ): Promise<void> {
+    this.mediasoup.closePeer(roomId, participantId);
+    state.peers.removePeer(participantId);
+
+    if (participantSaved) {
+      try {
+        await this.repository.removeParticipant(roomId, participantId);
+      } catch (error) {
+        this.logger?.warn("failed to remove participant after failed join", {
+          roomId,
+          participantId,
+          error: String(error),
+        });
+      }
+    }
+
+    if (state.peers.count() === 0) {
+      if (state.cleanupTimer) {
+        clearTimeout(state.cleanupTimer);
+        state.cleanupTimer = undefined;
+      }
+      if (restoreEmptyTtl) {
+        try {
+          state.metadata = await this.repository.markRoomEmpty(state.metadata);
+        } catch (error) {
+          this.logger?.warn("failed to restore empty room TTL after failed join", {
+            roomId,
+            participantId,
+            error: String(error),
+          });
+        }
+      }
+      this.mediasoup.closeRoom(roomId);
+      this.rooms.delete(roomId);
+    }
+  }
+
   private async closeEmptyRoom(roomId: string): Promise<void> {
     await this.runExclusive(roomId, async () => {
       const state = this.rooms.get(roomId);
@@ -247,7 +405,6 @@ export class RoomManager {
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
       // Fix 2: delete lock after the await so no concurrent join sneaks in via a fresh mutex
-      await this.repository.closeRoom(state.metadata);
       this.roomLocks.delete(roomId);
     });
   }

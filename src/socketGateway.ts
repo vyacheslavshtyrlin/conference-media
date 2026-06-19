@@ -274,11 +274,28 @@ export class SocketGateway {
         context.socket.close(1000);
         return;
       }
+
+      case "room:close": {
+        this.assertJoined(context);
+        await this.roomManager.closeRoomByCreator(context.roomId, context.participantId);
+        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
+        this.broadcast(context.roomId, { type: "room:closed", reason: "closed_by_creator" });
+        this.closeRoomSockets(context.roomId, "Room closed");
+        return;
+      }
+
+      case "chat:send": {
+        this.assertJoined(context);
+        const message = await this.roomManager.sendChatMessage(context.roomId, context.participantId, event.text);
+        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: message });
+        this.broadcast(context.roomId, { type: "chat:messageAdded", message });
+        return;
+      }
     }
   }
 
   private async joinRoom(context: ClientContext, payload: Parameters<typeof this.roomManager.join>[0]): Promise<void> {
-    const { room, participant, participants } = await this.roomManager.join(payload);
+    const { room, participant, participants, chatMessages, joinMessage } = await this.roomManager.join(payload);
     context.joined = true;
     this.addRoomSocket(context.roomId, context.socket);
 
@@ -286,6 +303,7 @@ export class SocketGateway {
       type: "room:snapshot",
       roomId: room.roomId,
       participants,
+      chatMessages,
     });
 
     this.send(context.socket, {
@@ -304,6 +322,9 @@ export class SocketGateway {
     }
 
     this.broadcast(room.roomId, { type: "participant:joined", participant }, context.socket);
+    if (joinMessage) {
+      this.broadcast(room.roomId, { type: "chat:messageAdded", message: joinMessage }, context.socket);
+    }
   }
 
   private async leave(context: ClientContext): Promise<Participant | undefined> {
@@ -315,8 +336,13 @@ export class SocketGateway {
     // Fix 4: remove from roomSockets before broadcasting so the leaving socket
     // cannot receive subsequent events in the window before the close event fires.
     this.removeRoomSocket(context.roomId, context.socket);
-    const participant = await this.roomManager.leave(context.roomId, context.participantId);
-    this.broadcast(context.roomId, { type: "participant:left", participantId: context.participantId });
+    const { participant, chatMessage } = await this.roomManager.leave(context.roomId, context.participantId);
+    if (participant) {
+      this.broadcast(context.roomId, { type: "participant:left", participantId: context.participantId });
+    }
+    if (chatMessage) {
+      this.broadcast(context.roomId, { type: "chat:messageAdded", message: chatMessage });
+    }
     return participant;
   }
 
@@ -378,6 +404,25 @@ export class SocketGateway {
     if (sockets.size === 0) {
       this.roomSockets.delete(roomId);
     }
+  }
+
+  private closeRoomSockets(roomId: string, reason: string): void {
+    const sockets = this.roomSockets.get(roomId);
+    if (!sockets) {
+      return;
+    }
+
+    for (const socket of Array.from(sockets)) {
+      const context = this.clients.get(socket);
+      if (context) {
+        context.joined = false;
+        this.clients.delete(socket);
+      }
+      sockets.delete(socket);
+      socket.close(1000, reason);
+    }
+
+    this.roomSockets.delete(roomId);
   }
 
   private send(socket: WebSocket, event: ServerWebSocketEvent): void {
