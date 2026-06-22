@@ -75,6 +75,7 @@ export class RedisRoomRepository {
     await this.redis.persist(this.roomKey(activeRoom.roomId));
     await this.redis.persist(this.slugKey(activeRoom.slug));
     await this.redis.persist(this.chatKey(activeRoom.roomId));
+    await this.redis.persist(this.roomSessionsKey(activeRoom.roomId));
 
     return activeRoom;
   }
@@ -130,6 +131,7 @@ export class RedisRoomRepository {
     await this.redis.expire(this.roomKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
     await this.redis.expire(this.slugKey(emptyRoom.slug), EMPTY_ROOM_TTL_SECONDS);
     await this.redis.expire(this.chatKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
+    await this.redis.expire(this.roomSessionsKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
     await this.redis.del(this.participantsKey(emptyRoom.roomId));
 
     return emptyRoom;
@@ -148,6 +150,7 @@ export class RedisRoomRepository {
     await this.redis.expire(this.roomKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
     await this.redis.expire(this.slugKey(closedRoom.slug), EMPTY_ROOM_TTL_SECONDS);
     await this.redis.expire(this.chatKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
+    await this.redis.expire(this.roomSessionsKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
     await this.redis.del(this.participantsKey(closedRoom.roomId));
 
     return closedRoom;
@@ -167,5 +170,9 @@ export class RedisRoomRepository {
 
   private chatKey(roomId: string): string {
     return `room:${roomId}:chat`;
+  }
+
+  private roomSessionsKey(roomId: string): string {
+    return `room:${roomId}:sessions`;
   }
 }

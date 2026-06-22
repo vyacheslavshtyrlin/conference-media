@@ -49,6 +49,17 @@ export const joinRoomResponseSchema = z.object({
   participantId: z.string().min(1),
   isCreator: z.boolean(),
   token: z.string().min(1),
+  roomSessionToken: z.string().min(1),
+  signalingUrl: z.string().url(),
+});
+
+export const roomSessionRefreshRequestSchema = z.object({
+  participantId: z.string().trim().min(1),
+  roomSessionToken: z.string().min(1),
+});
+
+export const roomSessionRefreshResponseSchema = z.object({
+  token: z.string().min(1),
   signalingUrl: z.string().url(),
 });
 
@@ -58,6 +69,8 @@ export type CreateRoomResponse = z.infer<typeof createRoomResponseSchema>;
 export type GetRoomResponse = z.infer<typeof getRoomResponseSchema>;
 export type JoinRoomRequest = z.infer<typeof joinRoomRequestSchema>;
 export type JoinRoomResponse = z.infer<typeof joinRoomResponseSchema>;
+export type RoomSessionRefreshRequest = z.infer<typeof roomSessionRefreshRequestSchema>;
+export type RoomSessionRefreshResponse = z.infer<typeof roomSessionRefreshResponseSchema>;
 
 export const mediaStateValueSchema = z.enum(["on", "off", "muted", "error"]);
 export const mediaSourceSchema = z.enum(["mic", "camera", "screen"]);
