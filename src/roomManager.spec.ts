@@ -283,6 +283,23 @@ describe("RoomManager", () => {
     expect(repository.room.status).toBe("active");
   });
 
+  it("updates and persists participant connection quality", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createPayload("peer_1"));
+    const participant = await manager.setConnectionQuality(room.roomId, "peer_1", "poor");
+
+    expect(participant.connectionQuality).toBe("poor");
+    expect(repository.participants.get("peer_1")?.connectionQuality).toBe("poor");
+    expect(manager.getParticipants(room.roomId)[0]?.connectionQuality).toBe("poor");
+  });
+
   it("allows the creator participant to close the room", async () => {
     const repository = new FakeRepository();
     const mediasoup = new FakeMediasoupService();

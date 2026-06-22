@@ -11,6 +11,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import type { Logger } from "./logger.js";
 import type { RoomManager } from "./roomManager.js";
 import { SocketGateway } from "./socketGateway.js";
+import { SignalingError } from "./errors.js";
 import type { JoinTokenPayload } from "./token.js";
 
 const JOIN_TOKEN_SECRET = "test-secret";
@@ -47,6 +48,7 @@ function createParticipant(payload: JoinTokenPayload): Participant {
     isCreator: payload.isCreator,
     joinedAt: createdAt,
     connectionState: "online",
+    connectionQuality: "good",
     media: {
       mic: "off",
       camera: "off",
@@ -103,6 +105,15 @@ function createRoomManagerMock() {
     consume: vi.fn(),
     closeProducer: vi.fn(),
     setMedia: vi.fn(),
+    setConnectionQuality: vi.fn(async (_roomId: string, participantId: string, quality: Participant["connectionQuality"]) => {
+      const participant = participants.get(participantId);
+      if (!participant) {
+        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+      }
+      const next = { ...participant, connectionQuality: quality };
+      participants.set(participantId, next);
+      return next;
+    }),
     closeRoomByCreator: vi.fn(),
   });
 }
@@ -228,6 +239,13 @@ function joinPayload(participantId: string, displayName: string): JoinTokenPaylo
   };
 }
 
+function creatorPayload(participantId: string, displayName: string): JoinTokenPayload {
+  return {
+    ...joinPayload(participantId, displayName),
+    isCreator: true,
+  };
+}
+
 describe("SocketGateway chat protocol", () => {
   afterEach(async () => {
     gateway?.stop();
@@ -330,6 +348,38 @@ describe("SocketGateway chat protocol", () => {
     expect(roomManager.sendChatMessage).toHaveBeenCalledWith(room.roomId, "peer_a", text);
   });
 
+  it("stores and broadcasts participant connection quality updates", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, joinPayload("peer_a", "Alice"));
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "quality_1",
+    );
+    const broadcastPromise = waitForMessage(
+      bob,
+      (message) => message.type === "participant:connectionQualityChanged",
+    );
+
+    alice.send(JSON.stringify({
+      type: "participant:setConnectionQuality",
+      requestId: "quality_1",
+      quality: "poor",
+    }));
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "quality_1",
+      ok: true,
+    });
+    await expect(broadcastPromise).resolves.toMatchObject({
+      type: "participant:connectionQualityChanged",
+      participantId: "peer_a",
+      quality: "poor",
+    });
+    expect(roomManager.setConnectionQuality).toHaveBeenCalledWith(room.roomId, "peer_a", "poor");
+  });
+
   it("rejects chat text above the configured maximum length", async () => {
     const { roomManager, url } = await createTestGateway();
     const alice = await connectClient(url, joinPayload("peer_a", "Alice"));
@@ -355,6 +405,65 @@ describe("SocketGateway chat protocol", () => {
       },
     });
     expect(roomManager.sendChatMessage).not.toHaveBeenCalled();
+  });
+
+  it("lets the creator close the room and notifies all connected clients", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, creatorPayload("peer_creator", "Alice"));
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "close_room",
+    );
+    const aliceClosedPromise = waitForMessage(
+      alice,
+      (message) => message.type === "room:closed",
+    );
+    const bobClosedPromise = waitForMessage(
+      bob,
+      (message) => message.type === "room:closed",
+    );
+
+    alice.send(JSON.stringify({ type: "room:close", requestId: "close_room" }));
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "close_room",
+      ok: true,
+    });
+    await expect(aliceClosedPromise).resolves.toMatchObject({
+      type: "room:closed",
+      reason: "closed_by_creator",
+    });
+    await expect(bobClosedPromise).resolves.toMatchObject({
+      type: "room:closed",
+      reason: "closed_by_creator",
+    });
+    expect(roomManager.closeRoomByCreator).toHaveBeenCalledWith(room.roomId, "peer_creator");
+  });
+
+  it("rejects room close from non-creator participants", async () => {
+    const { roomManager, url } = await createTestGateway();
+    roomManager.closeRoomByCreator.mockRejectedValueOnce(
+      new SignalingError("INVALID_TOKEN", "Only the room creator can close the room"),
+    );
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+    const responsePromise = waitForMessage(
+      bob,
+      (message) => message.type === "response" && message.requestId === "close_room",
+    );
+
+    bob.send(JSON.stringify({ type: "room:close", requestId: "close_room" }));
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "close_room",
+      ok: false,
+      error: {
+        code: "INVALID_TOKEN",
+      },
+    });
+    expect(roomManager.closeRoomByCreator).toHaveBeenCalledWith(room.roomId, "peer_b");
   });
 
   it("broadcasts media server room close reason before closing room sockets", async () => {

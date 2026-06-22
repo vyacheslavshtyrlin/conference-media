@@ -1,4 +1,4 @@
-import type { Participant, ParticipantMedia } from "#contracts";
+import type { Participant, ParticipantConnectionQuality, ParticipantMedia } from "#contracts";
 
 import type { JoinTokenPayload } from "./token.js";
 
@@ -23,6 +23,7 @@ export class PeerManager {
       isCreator: payload.isCreator,
       joinedAt: new Date().toISOString(),
       connectionState: "online",
+      connectionQuality: "good",
       media: { ...defaultMedia },
     };
 
@@ -37,6 +38,20 @@ export class PeerManager {
     }
 
     const next = { ...participant, media };
+    this.participants.set(participantId, next);
+    return next;
+  }
+
+  setConnectionQuality(
+    participantId: string,
+    connectionQuality: ParticipantConnectionQuality,
+  ): Participant | undefined {
+    const participant = this.participants.get(participantId);
+    if (!participant) {
+      return undefined;
+    }
+
+    const next = { ...participant, connectionQuality };
     this.participants.set(participantId, next);
     return next;
   }

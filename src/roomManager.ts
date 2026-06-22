@@ -1,5 +1,13 @@
 import { CHAT_HISTORY_LIMIT, CHAT_MESSAGE_TEXT_MAX_LENGTH, MAX_ROOM_PARTICIPANTS } from "#contracts";
-import type { ChatMessage, MediaKind, Participant, ParticipantMedia, RoomClosedReason, RoomMetadata } from "#contracts";
+import type {
+  ChatMessage,
+  MediaKind,
+  Participant,
+  ParticipantConnectionQuality,
+  ParticipantMedia,
+  RoomClosedReason,
+  RoomMetadata,
+} from "#contracts";
 import { Mutex } from "async-mutex";
 import { randomUUID } from "node:crypto";
 
@@ -144,6 +152,24 @@ export class RoomManager {
       const state = this.requireRuntimeRoom(roomId);
 
       const participant = state.peers.setMedia(participantId, media);
+      if (!participant) {
+        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+      }
+
+      await this.repository.saveParticipant(roomId, participant);
+      return participant;
+    });
+  }
+
+  async setConnectionQuality(
+    roomId: string,
+    participantId: string,
+    connectionQuality: ParticipantConnectionQuality,
+  ): Promise<Participant> {
+    return this.runExclusive(roomId, async () => {
+      const state = this.requireRuntimeRoom(roomId);
+
+      const participant = state.peers.setConnectionQuality(participantId, connectionQuality);
       if (!participant) {
         throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
       }

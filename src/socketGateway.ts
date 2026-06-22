@@ -269,6 +269,21 @@ export class SocketGateway {
         return;
       }
 
+      case "participant:setConnectionQuality": {
+        const participant = await this.roomManager.setConnectionQuality(
+          context.roomId,
+          context.participantId,
+          event.quality,
+        );
+        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
+        this.broadcast(context.roomId, {
+          type: "participant:connectionQualityChanged",
+          participantId: participant.participantId,
+          quality: participant.connectionQuality,
+        });
+        return;
+      }
+
       case "room:leave": {
         await this.leave(context);
         this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });

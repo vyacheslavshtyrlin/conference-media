@@ -84,6 +84,7 @@ export type RoomSessionRefreshResponse = z.infer<typeof roomSessionRefreshRespon
 export const mediaStateValueSchema = z.enum(["on", "off", "muted", "error"]);
 export const mediaSourceSchema = z.enum(["mic", "camera", "screen"]);
 export const connectionStateSchema = z.literal("online");
+export const participantConnectionQualitySchema = z.enum(["good", "unstable", "poor", "reconnecting"]);
 export const transportDirectionSchema = z.enum(["send", "recv"]);
 export const mediaKindSchema = z.enum(["audio", "video"]);
 
@@ -99,12 +100,14 @@ export const participantSchema = z.object({
   isCreator: z.boolean(),
   joinedAt: z.string().datetime(),
   connectionState: connectionStateSchema,
+  connectionQuality: participantConnectionQualitySchema,
   media: participantMediaSchema,
 });
 
 export type MediaStateValue = z.infer<typeof mediaStateValueSchema>;
 export type MediaSource = z.infer<typeof mediaSourceSchema>;
 export type ConnectionState = z.infer<typeof connectionStateSchema>;
+export type ParticipantConnectionQuality = z.infer<typeof participantConnectionQualitySchema>;
 export type TransportDirection = z.infer<typeof transportDirectionSchema>;
 export type MediaKind = z.infer<typeof mediaKindSchema>;
 export type ParticipantMedia = z.infer<typeof participantMediaSchema>;
@@ -231,6 +234,12 @@ export const setMediaStateRequestEventSchema = z.object({
   media: participantMediaSchema,
 });
 
+export const setConnectionQualityRequestEventSchema = z.object({
+  type: z.literal("participant:setConnectionQuality"),
+  requestId: requestIdSchema,
+  quality: participantConnectionQualitySchema,
+});
+
 export const roomLeaveRequestEventSchema = z.object({
   type: z.literal("room:leave"),
   requestId: requestIdSchema,
@@ -256,6 +265,7 @@ export const clientWebSocketEventSchema = z.discriminatedUnion("type", [
   consumeRequestEventSchema,
   closeProducerRequestEventSchema,
   setMediaStateRequestEventSchema,
+  setConnectionQualityRequestEventSchema,
   roomLeaveRequestEventSchema,
   roomCloseRequestEventSchema,
   chatSendRequestEventSchema,
@@ -275,6 +285,7 @@ export type ProduceRequestEvent = z.infer<typeof produceRequestEventSchema>;
 export type ConsumeRequestEvent = z.infer<typeof consumeRequestEventSchema>;
 export type CloseProducerRequestEvent = z.infer<typeof closeProducerRequestEventSchema>;
 export type SetMediaStateRequestEvent = z.infer<typeof setMediaStateRequestEventSchema>;
+export type SetConnectionQualityRequestEvent = z.infer<typeof setConnectionQualityRequestEventSchema>;
 export type RoomLeaveRequestEvent = z.infer<typeof roomLeaveRequestEventSchema>;
 export type RoomCloseRequestEvent = z.infer<typeof roomCloseRequestEventSchema>;
 export type ChatSendRequestEvent = z.infer<typeof chatSendRequestEventSchema>;
@@ -327,6 +338,12 @@ export const participantActiveSpeakerChangedEventSchema = z.object({
   participantId: z.string().min(1).nullable(),
 });
 
+export const participantConnectionQualityChangedEventSchema = z.object({
+  type: z.literal("participant:connectionQualityChanged"),
+  participantId: z.string().min(1),
+  quality: participantConnectionQualitySchema,
+});
+
 export const producerAddedEventSchema = z.object({
   type: z.literal("producer:added"),
   producerId: z.string().min(1),
@@ -359,6 +376,7 @@ export const serverWebSocketEventSchema = z.union([
   participantLeftEventSchema,
   participantMediaChangedEventSchema,
   participantActiveSpeakerChangedEventSchema,
+  participantConnectionQualityChangedEventSchema,
   producerAddedEventSchema,
   producerClosedEventSchema,
   roomClosedEventSchema,
@@ -373,6 +391,7 @@ export type ParticipantJoinedEvent = z.infer<typeof participantJoinedEventSchema
 export type ParticipantLeftEvent = z.infer<typeof participantLeftEventSchema>;
 export type ParticipantMediaChangedEvent = z.infer<typeof participantMediaChangedEventSchema>;
 export type ParticipantActiveSpeakerChangedEvent = z.infer<typeof participantActiveSpeakerChangedEventSchema>;
+export type ParticipantConnectionQualityChangedEvent = z.infer<typeof participantConnectionQualityChangedEventSchema>;
 export type ProducerAddedEvent = z.infer<typeof producerAddedEventSchema>;
 export type ProducerClosedEvent = z.infer<typeof producerClosedEventSchema>;
 export type RoomClosedEvent = z.infer<typeof roomClosedEventSchema>;
