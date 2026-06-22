@@ -1,4 +1,4 @@
-import type { ChatMessage, Participant, RoomMetadata } from "#contracts";
+import type { ChatMessage, Participant, RoomClosedReason, RoomMetadata } from "#contracts";
 import { describe, expect, it } from "vitest";
 
 import type { MediasoupService } from "./mediasoupService.js";
@@ -15,6 +15,7 @@ const room: RoomMetadata = {
   createdAt: new Date(Date.now() - 1_000).toISOString(),
   expiresAt: null,
   status: "active",
+  closedReason: null,
 };
 
 class FakeRepository {
@@ -23,6 +24,7 @@ class FakeRepository {
   activeTouches = 0;
   emptyMarks = 0;
   closedRooms = 0;
+  closedReason: RoomClosedReason | null = null;
   failAppendChatMessage = false;
   failListChatMessages = false;
   readonly participants = new Map<string, Participant>();
@@ -41,7 +43,7 @@ class FakeRepository {
 
   async touchActiveRoom(roomMetadata: RoomMetadata): Promise<RoomMetadata> {
     this.activeTouches += 1;
-    this.room = { ...roomMetadata, expiresAt: null, status: "active" };
+    this.room = { ...roomMetadata, expiresAt: null, status: "active", closedReason: null };
     return this.room;
   }
 
@@ -74,16 +76,19 @@ class FakeRepository {
       ...roomMetadata,
       expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
       status: "active",
+      closedReason: null,
     };
     return this.room;
   }
 
-  async closeRoom(roomMetadata: RoomMetadata): Promise<RoomMetadata> {
+  async closeRoom(roomMetadata: RoomMetadata, reason: RoomClosedReason = "closed_by_creator"): Promise<RoomMetadata> {
     this.closedRooms += 1;
+    this.closedReason = reason;
     this.room = {
       ...roomMetadata,
       expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
       status: "closed",
+      closedReason: reason,
     };
     this.participants.clear();
     return this.room;
@@ -94,9 +99,9 @@ class FakeMediasoupService {
   ensureRoomCalls = 0;
   closeRoomCalls = 0;
   closePeerCalls = 0;
-  private roomDeadCallback?: (roomId: string) => void;
+  private roomDeadCallback?: (roomId: string, reason: RoomClosedReason) => void;
 
-  setRoomDeadCallback(callback: (roomId: string) => void): void {
+  setRoomDeadCallback(callback: (roomId: string, reason: RoomClosedReason) => void): void {
     this.roomDeadCallback = callback;
   }
 
@@ -120,7 +125,7 @@ class FakeMediasoupService {
   }
 
   simulateWorkerDeath(roomId: string): void {
-    this.roomDeadCallback?.(roomId);
+    this.roomDeadCallback?.(roomId, "media_server_error");
   }
 }
 
@@ -241,6 +246,7 @@ describe("RoomManager", () => {
       ...room,
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
       status: "active",
+      closedReason: null,
     };
     repository.failListChatMessages = true;
     const mediasoup = new FakeMediasoupService();
@@ -291,7 +297,32 @@ describe("RoomManager", () => {
 
     expect(repository.closedRooms).toBe(1);
     expect(repository.room.status).toBe("closed");
+    expect(repository.closedReason).toBe("closed_by_creator");
     expect(mediasoup.closeRoomCalls).toBe(1);
+  });
+
+  it("marks a room closed with media_server_error when the mediasoup room dies", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+    const closedEvents: Array<{ roomId: string; reason: RoomClosedReason }> = [];
+    manager.setRoomClosedCallback((roomId, reason) => {
+      closedEvents.push({ roomId, reason });
+    });
+
+    await manager.join(createPayload("peer_1"));
+    mediasoup.simulateWorkerDeath(room.roomId);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(closedEvents).toEqual([{ roomId: room.roomId, reason: "media_server_error" }]);
+    expect(repository.closedRooms).toBe(1);
+    expect(repository.closedReason).toBe("media_server_error");
+    expect(repository.room.status).toBe("closed");
+    expect(repository.room.closedReason).toBe("media_server_error");
   });
 
   it("rejects room close from non-creator participants", async () => {

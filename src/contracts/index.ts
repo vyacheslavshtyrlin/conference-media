@@ -17,6 +17,13 @@ export type HealthStatus = z.infer<typeof healthStatusSchema>;
 
 export const roomStatusSchema = z.enum(["active", "closed"]);
 export const roomExpiresAtSchema = z.string().datetime().nullable();
+export const roomClosedReasonSchema = z.enum([
+  "closed_by_creator",
+  "empty_timeout",
+  "server_shutdown",
+  "media_server_error",
+]);
+export const roomClosedReasonValueSchema = roomClosedReasonSchema.nullable();
 
 export const createRoomRequestSchema = z.object({}).strict();
 
@@ -35,6 +42,7 @@ export const getRoomResponseSchema = z.object({
   slug: z.string().min(1),
   expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
+  closedReason: roomClosedReasonValueSchema.optional().default(null),
   mediaNodeId: z.string().min(1),
   signalingUrl: z.string().url(),
   participantCount: z.number().int().nonnegative(),
@@ -64,6 +72,7 @@ export const roomSessionRefreshResponseSchema = z.object({
 });
 
 export type RoomStatus = z.infer<typeof roomStatusSchema>;
+export type RoomClosedReason = z.infer<typeof roomClosedReasonSchema>;
 export type CreateRoomRequest = z.infer<typeof createRoomRequestSchema>;
 export type CreateRoomResponse = z.infer<typeof createRoomResponseSchema>;
 export type GetRoomResponse = z.infer<typeof getRoomResponseSchema>;
@@ -333,12 +342,6 @@ export const producerClosedEventSchema = z.object({
   source: mediaSourceSchema,
 });
 
-export const roomClosedReasonSchema = z.enum([
-  "closed_by_creator",
-  "empty_timeout",
-  "server_shutdown",
-]);
-
 export const roomClosedEventSchema = z.object({
   type: z.literal("room:closed"),
   reason: roomClosedReasonSchema,
@@ -372,7 +375,6 @@ export type ParticipantMediaChangedEvent = z.infer<typeof participantMediaChange
 export type ParticipantActiveSpeakerChangedEvent = z.infer<typeof participantActiveSpeakerChangedEventSchema>;
 export type ProducerAddedEvent = z.infer<typeof producerAddedEventSchema>;
 export type ProducerClosedEvent = z.infer<typeof producerClosedEventSchema>;
-export type RoomClosedReason = z.infer<typeof roomClosedReasonSchema>;
 export type RoomClosedEvent = z.infer<typeof roomClosedEventSchema>;
 export type ChatMessageAddedEvent = z.infer<typeof chatMessageAddedEventSchema>;
 export type ServerWebSocketEvent = z.infer<typeof serverWebSocketEventSchema>;
@@ -386,6 +388,7 @@ export const roomMetadataSchema = z.object({
   createdAt: z.string().datetime(),
   expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
+  closedReason: roomClosedReasonValueSchema.optional().default(null),
 });
 
 export type RoomMetadata = z.infer<typeof roomMetadataSchema>;

@@ -6,7 +6,7 @@ import {
   participantSchema,
   roomMetadataSchema,
 } from "#contracts";
-import type { ChatMessage, Participant, RoomMetadata } from "#contracts";
+import type { ChatMessage, Participant, RoomClosedReason, RoomMetadata } from "#contracts";
 
 import { SignalingError } from "./errors.js";
 
@@ -68,6 +68,7 @@ export class RedisRoomRepository {
       ...room,
       expiresAt: null,
       status: "active",
+      closedReason: null,
     });
 
     await this.redis.set(this.roomKey(activeRoom.roomId), JSON.stringify(activeRoom));
@@ -124,6 +125,7 @@ export class RedisRoomRepository {
       ...room,
       expiresAt,
       status: "active",
+      closedReason: null,
     });
 
     await this.redis.set(this.roomKey(emptyRoom.roomId), JSON.stringify(emptyRoom));
@@ -137,12 +139,13 @@ export class RedisRoomRepository {
     return emptyRoom;
   }
 
-  async closeRoom(room: RoomMetadata): Promise<RoomMetadata> {
+  async closeRoom(room: RoomMetadata, reason: RoomClosedReason = "closed_by_creator"): Promise<RoomMetadata> {
     const expiresAt = new Date(Date.now() + EMPTY_ROOM_TTL_SECONDS * 1000).toISOString();
     const closedRoom = roomMetadataSchema.parse({
       ...room,
       expiresAt,
       status: "closed",
+      closedReason: reason,
     });
 
     await this.redis.set(this.roomKey(closedRoom.roomId), JSON.stringify(closedRoom));

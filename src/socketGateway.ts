@@ -3,6 +3,7 @@ import type {
   ClientWebSocketEvent,
   ErrorCode,
   Participant,
+  RoomClosedReason,
   ServerWebSocketEvent,
 } from "#contracts";
 import type { IncomingMessage } from "node:http";
@@ -47,8 +48,8 @@ export class SocketGateway {
   ) {}
 
   start(): void {
-    this.roomManager.setParticipantEvictedCallback((roomId, participantId) => {
-      this.handleParticipantEvicted(roomId, participantId);
+    this.roomManager.setRoomClosedCallback((roomId, reason) => {
+      this.handleRoomClosedByServer(roomId, reason);
     });
     this.roomManager.setActiveSpeakerChangedCallback((roomId, participantId) => {
       this.broadcast(roomId, {
@@ -346,26 +347,9 @@ export class SocketGateway {
     return participant;
   }
 
-  // Called when a mediasoup worker dies and RoomManager has evicted a participant.
-  private handleParticipantEvicted(roomId: string, participantId: string): void {
-    // Remove the evicted socket from roomSockets BEFORE broadcasting so it does
-    // not receive its own participant:left event. Search only room-scoped sockets
-    // (O(room-size)) instead of scanning all connected clients.
-    const roomSocketSet = this.roomSockets.get(roomId);
-    if (roomSocketSet) {
-      for (const socket of roomSocketSet) {
-        const context = this.clients.get(socket);
-        if (context?.participantId === participantId) {
-          context.joined = false;
-          this.removeRoomSocket(roomId, socket);
-          this.clients.delete(socket);
-          socket.close(1011, "Media server error");
-          break;
-        }
-      }
-    }
-
-    this.broadcast(roomId, { type: "participant:left", participantId });
+  private handleRoomClosedByServer(roomId: string, reason: RoomClosedReason): void {
+    this.broadcast(roomId, { type: "room:closed", reason });
+    this.closeRoomSockets(roomId, reason === "media_server_error" ? "Media server error" : "Room closed");
   }
 
   private async handleDisconnect(context: ClientContext): Promise<void> {

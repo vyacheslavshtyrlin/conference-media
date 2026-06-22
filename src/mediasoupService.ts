@@ -1,5 +1,5 @@
 import * as mediasoup from "mediasoup";
-import type { CreateWebRtcTransportResponseData } from "#contracts";
+import type { CreateWebRtcTransportResponseData, RoomClosedReason } from "#contracts";
 import type {
   Consumer,
   DtlsParameters,
@@ -70,7 +70,7 @@ export class MediasoupService {
   private readonly rooms = new Map<string, RuntimeRoom>();
   private workers: Worker[] = [];
   private nextWorkerIndex = 0;
-  private onRoomDeadCallback?: (roomId: string) => void;
+  private onRoomDeadCallback?: (roomId: string, reason: RoomClosedReason) => void;
   private onActiveSpeakerChangedCallback?: (roomId: string, participantId: string | null) => void;
 
   constructor(
@@ -78,7 +78,7 @@ export class MediasoupService {
     private readonly logger?: Logger,
   ) {}
 
-  setRoomDeadCallback(callback: (roomId: string) => void): void {
+  setRoomDeadCallback(callback: (roomId: string, reason: RoomClosedReason) => void): void {
     this.onRoomDeadCallback = callback;
   }
 
@@ -102,7 +102,7 @@ export class MediasoupService {
         this.logger?.error("mediasoup worker died", { workerIndex: index });
         for (const [roomId, room] of [...this.rooms.entries()]) {
           if (room.workerIndex === index) {
-            this.closeDeadRoom(roomId);
+            this.closeDeadRoom(roomId, "media_server_error");
           }
         }
       });
@@ -116,7 +116,7 @@ export class MediasoupService {
     // Notify RoomManager (and through it SocketGateway) for every live room so
     // Redis participant records are cleaned up even on graceful shutdown.
     for (const roomId of [...this.rooms.keys()]) {
-      this.closeDeadRoom(roomId);
+      this.closeDeadRoom(roomId, "server_shutdown");
     }
     for (const worker of this.workers) {
       worker.close();
@@ -551,7 +551,7 @@ export class MediasoupService {
     this.onActiveSpeakerChangedCallback?.(roomId, participantId);
   }
 
-  private closeDeadRoom(roomId: string): void {
+  private closeDeadRoom(roomId: string, reason: RoomClosedReason): void {
     const room = this.rooms.get(roomId);
     if (!room) {
       return;
@@ -561,6 +561,6 @@ export class MediasoupService {
     room.producers.clear();
     room.consumers.clear();
     this.rooms.delete(roomId);
-    this.onRoomDeadCallback?.(roomId);
+    this.onRoomDeadCallback?.(roomId, reason);
   }
 }

@@ -1,5 +1,5 @@
 import { CHAT_HISTORY_LIMIT, CHAT_MESSAGE_TEXT_MAX_LENGTH, MAX_ROOM_PARTICIPANTS } from "#contracts";
-import type { ChatMessage, MediaKind, Participant, ParticipantMedia, RoomMetadata } from "#contracts";
+import type { ChatMessage, MediaKind, Participant, ParticipantMedia, RoomClosedReason, RoomMetadata } from "#contracts";
 import { Mutex } from "async-mutex";
 import { randomUUID } from "node:crypto";
 
@@ -19,7 +19,7 @@ type RuntimeRoomState = {
 export class RoomManager {
   private readonly rooms = new Map<string, RuntimeRoomState>();
   private readonly roomLocks = new Map<string, Mutex>();
-  private onParticipantEvictedCallback?: (roomId: string, participantId: string) => void;
+  private onRoomClosedCallback?: (roomId: string, reason: RoomClosedReason) => void;
   private onActiveSpeakerChangedCallback?: (roomId: string, participantId: string | null) => void;
 
   constructor(
@@ -28,16 +28,16 @@ export class RoomManager {
     private readonly emptyGraceMs: number,
     private readonly logger?: Logger,
   ) {
-    mediasoup.setRoomDeadCallback((roomId) => {
-      this.handleRoomDead(roomId);
+    mediasoup.setRoomDeadCallback((roomId, reason) => {
+      this.handleRoomDead(roomId, reason);
     });
     mediasoup.setActiveSpeakerChangedCallback((roomId, participantId) => {
       this.onActiveSpeakerChangedCallback?.(roomId, participantId);
     });
   }
 
-  setParticipantEvictedCallback(callback: (roomId: string, participantId: string) => void): void {
-    this.onParticipantEvictedCallback = callback;
+  setRoomClosedCallback(callback: (roomId: string, reason: RoomClosedReason) => void): void {
+    this.onRoomClosedCallback = callback;
   }
 
   setActiveSpeakerChangedCallback(callback: (roomId: string, participantId: string | null) => void): void {
@@ -219,7 +219,7 @@ export class RoomManager {
 
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
-      await this.repository.closeRoom(state.metadata);
+      await this.repository.closeRoom(state.metadata, "closed_by_creator");
       this.roomLocks.delete(roomId);
     });
   }
@@ -283,7 +283,7 @@ export class RoomManager {
   }
 
   // Called when a mediasoup worker dies — evicts all participants in the affected room.
-  private handleRoomDead(roomId: string): void {
+  private handleRoomDead(roomId: string, reason: RoomClosedReason): void {
     this.runExclusive(roomId, async () => {
       const state = this.rooms.get(roomId);
       if (!state) {
@@ -294,15 +294,9 @@ export class RoomManager {
         clearTimeout(state.cleanupTimer);
       }
 
-      // Notify gateway per-participant before wiping Redis state.
-      // removeParticipant per-peer is skipped: closeRoom below deletes
-      // the entire participants hash in one DEL, making per-entry hDel redundant.
-      for (const participant of state.peers.list()) {
-        this.onParticipantEvictedCallback?.(roomId, participant.participantId);
-      }
-
       this.rooms.delete(roomId);
-      await this.repository.closeRoom(state.metadata);
+      await this.repository.closeRoom(state.metadata, reason);
+      this.onRoomClosedCallback?.(roomId, reason);
       this.roomLocks.delete(roomId);
     }).catch((error: unknown) => {
       this.logger?.error("handleRoomDead cleanup failed", { roomId, error: String(error) });

@@ -27,6 +27,7 @@ const room: RoomMetadata = {
   createdAt,
   expiresAt: null,
   status: "active",
+  closedReason: null,
 };
 
 const logger: Logger = {
@@ -56,9 +57,16 @@ function createParticipant(payload: JoinTokenPayload): Participant {
 
 function createRoomManagerMock() {
   const participants = new Map<string, Participant>();
+  const roomManager = {
+    roomClosedCallback: undefined as
+      | undefined
+      | ((roomId: string, reason: "closed_by_creator" | "empty_timeout" | "server_shutdown" | "media_server_error") => void),
+  };
 
-  return {
-    setParticipantEvictedCallback: vi.fn(),
+  return Object.assign(roomManager, {
+    setRoomClosedCallback: vi.fn((callback) => {
+      roomManager.roomClosedCallback = callback;
+    }),
     setActiveSpeakerChangedCallback: vi.fn(),
     join: vi.fn(async (payload: JoinTokenPayload) => {
       const participant = createParticipant(payload);
@@ -96,7 +104,7 @@ function createRoomManagerMock() {
     closeProducer: vi.fn(),
     setMedia: vi.fn(),
     closeRoomByCreator: vi.fn(),
-  };
+  });
 }
 
 function createJoinToken(payload: JoinTokenPayload): string {
@@ -347,5 +355,30 @@ describe("SocketGateway chat protocol", () => {
       },
     });
     expect(roomManager.sendChatMessage).not.toHaveBeenCalled();
+  });
+
+  it("broadcasts media server room close reason before closing room sockets", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, joinPayload("peer_a", "Alice"));
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+    const aliceClosedPromise = waitForMessage(
+      alice,
+      (message) => message.type === "room:closed",
+    );
+    const bobClosedPromise = waitForMessage(
+      bob,
+      (message) => message.type === "room:closed",
+    );
+
+    roomManager.roomClosedCallback?.(room.roomId, "media_server_error");
+
+    await expect(aliceClosedPromise).resolves.toMatchObject({
+      type: "room:closed",
+      reason: "media_server_error",
+    });
+    await expect(bobClosedPromise).resolves.toMatchObject({
+      type: "room:closed",
+      reason: "media_server_error",
+    });
   });
 });
