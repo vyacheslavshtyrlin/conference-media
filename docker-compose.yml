@@ -44,6 +44,8 @@ services:
   redis:
     image: redis:7-alpine
     command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_BIND_ADDR:-0.0.0.0}:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
