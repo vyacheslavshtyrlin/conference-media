@@ -24,7 +24,6 @@ const room: RoomMetadata = {
   slug: "room-one",
   mediaNodeId: "local",
   signalingUrl: "ws://127.0.0.1/ws",
-  creatorTokenHash: "creator-token-hash",
   createdAt,
   expiresAt: null,
   status: "active",
@@ -214,6 +213,16 @@ function closeClient(client: WebSocket): Promise<void> {
   });
 }
 
+function waitForClose(client: WebSocket): Promise<void> {
+  if (client.readyState === WebSocket.CLOSED) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    client.once("close", resolve);
+  });
+}
+
 function closeServer(server: WebSocketServer | undefined): Promise<void> {
   if (!server) {
     return Promise.resolve();
@@ -301,6 +310,30 @@ describe("SocketGateway chat protocol", () => {
         text: "hello",
         createdAt,
       },
+    });
+  });
+
+  it("supersedes an existing socket for the same participant session without leaving the room", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const first = await connectClient(url, joinPayload("peer_a", "Alice"));
+    const firstClosed = waitForClose(first);
+
+    const second = await connectClient(url, joinPayload("peer_a", "Alice"));
+    await firstClosed;
+
+    expect(roomManager.join).toHaveBeenCalledTimes(2);
+    expect(roomManager.leave).not.toHaveBeenCalled();
+
+    const responsePromise = waitForMessage(
+      second,
+      (message) => message.type === "response" && message.requestId === "req_chat_after_supersede",
+    );
+    second.send(JSON.stringify({ type: "chat:send", requestId: "req_chat_after_supersede", text: "still here" }));
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "req_chat_after_supersede",
+      ok: true,
     });
   });
 

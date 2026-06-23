@@ -37,6 +37,7 @@ type ClientContext = {
 export class SocketGateway {
   private readonly clients = new Map<WebSocket, ClientContext>();
   private readonly roomSockets = new Map<string, Set<WebSocket>>();
+  private readonly participantSockets = new Map<string, WebSocket>();
   private heartbeatTimer?: NodeJS.Timeout;
 
   constructor(
@@ -77,6 +78,7 @@ export class SocketGateway {
       context.socket.close(1001, "Server shutting down");
     }
     this.roomSockets.clear();
+    this.participantSockets.clear();
   }
 
   private async handleConnection(socket: WebSocket, request: IncomingMessage): Promise<void> {
@@ -313,6 +315,7 @@ export class SocketGateway {
   private async joinRoom(context: ClientContext, payload: Parameters<typeof this.roomManager.join>[0]): Promise<void> {
     const { room, participant, participants, chatMessages, joinMessage } = await this.roomManager.join(payload);
     context.joined = true;
+    this.replaceParticipantSocket(context);
     this.addRoomSocket(context.roomId, context.socket);
 
     this.send(context.socket, {
@@ -352,6 +355,7 @@ export class SocketGateway {
     // Fix 4: remove from roomSockets before broadcasting so the leaving socket
     // cannot receive subsequent events in the window before the close event fires.
     this.removeRoomSocket(context.roomId, context.socket);
+    this.removeParticipantSocket(context);
     const { participant, chatMessage } = await this.roomManager.leave(context.roomId, context.participantId);
     if (participant) {
       this.broadcast(context.roomId, { type: "participant:left", participantId: context.participantId });
@@ -370,6 +374,7 @@ export class SocketGateway {
   private async handleDisconnect(context: ClientContext): Promise<void> {
     this.clients.delete(context.socket);
     this.removeRoomSocket(context.roomId, context.socket);
+    this.removeParticipantSocket(context);
     await this.leave(context);
   }
 
@@ -394,6 +399,33 @@ export class SocketGateway {
     sockets.add(socket);
   }
 
+  private replaceParticipantSocket(context: ClientContext): void {
+    const key = this.participantSocketKey(context.roomId, context.participantId);
+    const previousSocket = this.participantSockets.get(key);
+    if (previousSocket && previousSocket !== context.socket) {
+      const previousContext = this.clients.get(previousSocket);
+      if (previousContext) {
+        previousContext.joined = false;
+        this.removeRoomSocket(previousContext.roomId, previousSocket);
+        this.clients.delete(previousSocket);
+      }
+      previousSocket.close(1000, "Session superseded");
+    }
+
+    this.participantSockets.set(key, context.socket);
+  }
+
+  private removeParticipantSocket(context: ClientContext): void {
+    const key = this.participantSocketKey(context.roomId, context.participantId);
+    if (this.participantSockets.get(key) === context.socket) {
+      this.participantSockets.delete(key);
+    }
+  }
+
+  private participantSocketKey(roomId: string, participantId: string): string {
+    return `${roomId}:${participantId}`;
+  }
+
   private removeRoomSocket(roomId: string, socket: WebSocket): void {
     const sockets = this.roomSockets.get(roomId);
     if (!sockets) {
@@ -415,6 +447,7 @@ export class SocketGateway {
       const context = this.clients.get(socket);
       if (context) {
         context.joined = false;
+        this.removeParticipantSocket(context);
         this.clients.delete(socket);
       }
       sockets.delete(socket);

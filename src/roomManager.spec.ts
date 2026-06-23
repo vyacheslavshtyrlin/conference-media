@@ -11,7 +11,6 @@ const room: RoomMetadata = {
   slug: "room-one",
   mediaNodeId: "local",
   signalingUrl: "ws://localhost:4000/ws",
-  creatorTokenHash: "creator-token-hash",
   createdAt: new Date(Date.now() - 1_000).toISOString(),
   expiresAt: null,
   status: "active",

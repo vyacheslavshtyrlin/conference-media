@@ -31,7 +31,8 @@ export const createRoomResponseSchema = z.object({
   roomId: z.string().min(1),
   slug: z.string().min(1),
   joinUrl: z.string().url(),
-  creatorToken: z.string().min(1),
+  participantId: z.string().min(1),
+  roomSessionToken: z.string().min(1),
   mediaNodeId: z.string().min(1),
   signalingUrl: z.string().url(),
   expiresAt: roomExpiresAtSchema,
@@ -50,7 +51,7 @@ export const getRoomResponseSchema = z.object({
 
 export const joinRoomRequestSchema = z.object({
   displayName: z.string().trim().min(1).max(80),
-  creatorToken: z.string().min(1).optional(),
+  roomSessionToken: z.string().min(1).optional(),
 });
 
 export const joinRoomResponseSchema = z.object({
@@ -403,7 +404,6 @@ export const roomMetadataSchema = z.object({
   slug: z.string().min(1),
   mediaNodeId: z.string().min(1),
   signalingUrl: z.string().url(),
-  creatorTokenHash: z.string().min(1),
   createdAt: z.string().datetime(),
   expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
