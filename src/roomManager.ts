@@ -254,6 +254,28 @@ export class RoomManager {
     return this.mediasoup.listProducers(roomId);
   }
 
+  async releaseParticipantMedia(roomId: string, participantId: string): Promise<Participant | undefined> {
+    return this.runExclusive(roomId, async () => {
+      const state = this.requireRuntimeRoom(roomId);
+      const participant = state.peers.getPeer(participantId);
+      if (!participant) {
+        return undefined;
+      }
+
+      this.mediasoup.closePeer(roomId, participantId);
+      const next = state.peers.setMedia(participantId, {
+        mic: "off",
+        camera: "off",
+        screen: "off",
+      });
+      if (next) {
+        await this.repository.saveParticipant(roomId, next);
+      }
+
+      return next;
+    });
+  }
+
   getActiveSpeakerParticipantId(roomId: string): string | null {
     return this.mediasoup.getActiveSpeakerParticipantId(roomId);
   }

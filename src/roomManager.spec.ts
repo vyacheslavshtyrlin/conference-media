@@ -197,6 +197,43 @@ describe("RoomManager", () => {
     expect(repository.chatMessages.map((message) => message.kind)).toEqual(["system", "user", "system"]);
   });
 
+  it("releases participant media without removing the participant during session takeover", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createPayload("peer_1"));
+    await manager.setMedia(room.roomId, "peer_1", {
+      mic: "on",
+      camera: "on",
+      screen: "on",
+    });
+
+    const participant = await manager.releaseParticipantMedia(room.roomId, "peer_1");
+
+    expect(participant).toMatchObject({
+      participantId: "peer_1",
+      media: {
+        mic: "off",
+        camera: "off",
+        screen: "off",
+      },
+    });
+    expect(repository.participants.get("peer_1")).toMatchObject({
+      media: {
+        mic: "off",
+        camera: "off",
+        screen: "off",
+      },
+    });
+    expect(repository.participants.has("peer_1")).toBe(true);
+    expect(mediasoup.closePeerCalls).toBe(1);
+  });
+
   it("rolls back a new participant when chat history fails during join", async () => {
     const repository = new FakeRepository();
     repository.failListChatMessages = true;

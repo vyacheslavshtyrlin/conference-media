@@ -315,13 +315,25 @@ export class SocketGateway {
   private async joinRoom(context: ClientContext, payload: Parameters<typeof this.roomManager.join>[0]): Promise<void> {
     const { room, participant, participants, chatMessages, joinMessage } = await this.roomManager.join(payload);
     context.joined = true;
-    this.replaceParticipantSocket(context);
+    const releasedParticipant = await this.replaceParticipantSocket(context);
+    if (releasedParticipant) {
+      this.broadcast(room.roomId, {
+        type: "participant:mediaChanged",
+        participantId: releasedParticipant.participantId,
+        media: releasedParticipant.media,
+      });
+    }
+    const snapshotParticipants = releasedParticipant
+      ? participants.map((item) =>
+          item.participantId === releasedParticipant.participantId ? releasedParticipant : item,
+        )
+      : participants;
     this.addRoomSocket(context.roomId, context.socket);
 
     this.send(context.socket, {
       type: "room:snapshot",
       roomId: room.roomId,
-      participants,
+      participants: snapshotParticipants,
       chatMessages,
     });
 
@@ -399,7 +411,7 @@ export class SocketGateway {
     sockets.add(socket);
   }
 
-  private replaceParticipantSocket(context: ClientContext): void {
+  private async replaceParticipantSocket(context: ClientContext): Promise<Participant | undefined> {
     const key = this.participantSocketKey(context.roomId, context.participantId);
     const previousSocket = this.participantSockets.get(key);
     if (previousSocket && previousSocket !== context.socket) {
@@ -409,10 +421,17 @@ export class SocketGateway {
         this.removeRoomSocket(previousContext.roomId, previousSocket);
         this.clients.delete(previousSocket);
       }
+      const releasedParticipant = await this.roomManager.releaseParticipantMedia(
+        context.roomId,
+        context.participantId,
+      );
       previousSocket.close(1000, "Session superseded");
+      this.participantSockets.set(key, context.socket);
+      return releasedParticipant;
     }
 
     this.participantSockets.set(key, context.socket);
+    return undefined;
   }
 
   private removeParticipantSocket(context: ClientContext): void {

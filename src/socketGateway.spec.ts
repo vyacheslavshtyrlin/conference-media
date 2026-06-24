@@ -88,6 +88,21 @@ function createRoomManagerMock() {
     }),
     getActiveSpeakerParticipantId: vi.fn(() => null),
     listProducers: vi.fn(() => []),
+    releaseParticipantMedia: vi.fn(async (_roomId: string, participantId: string) => {
+      const participant = participants.get(participantId);
+      if (!participant) return undefined;
+
+      const next = {
+        ...participant,
+        media: {
+          mic: "off",
+          camera: "off",
+          screen: "off",
+        },
+      } satisfies Participant;
+      participants.set(participantId, next);
+      return next;
+    }),
     sendChatMessage: vi.fn(async (_roomId: string, participantId: string, text: string) => ({
       messageId: "msg_1",
       roomId: room.roomId,
@@ -103,7 +118,15 @@ function createRoomManagerMock() {
     produce: vi.fn(),
     consume: vi.fn(),
     closeProducer: vi.fn(),
-    setMedia: vi.fn(),
+    setMedia: vi.fn(async (_roomId: string, participantId: string, media: Participant["media"]) => {
+      const participant = participants.get(participantId);
+      if (!participant) {
+        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+      }
+      const next = { ...participant, media };
+      participants.set(participantId, next);
+      return next;
+    }),
     setConnectionQuality: vi.fn(async (_roomId: string, participantId: string, quality: Participant["connectionQuality"]) => {
       const participant = participants.get(participantId);
       if (!participant) {
@@ -155,15 +178,24 @@ async function createTestGateway(roomManager = createRoomManagerMock()) {
 }
 
 async function connectClient(baseUrl: string, payload: JoinTokenPayload): Promise<WebSocket> {
+  const { client } = await connectClientWithSnapshot(baseUrl, payload);
+
+  return client;
+}
+
+async function connectClientWithSnapshot(
+  baseUrl: string,
+  payload: JoinTokenPayload,
+): Promise<{ client: WebSocket; snapshot: JsonMessage }> {
   const token = createJoinToken(payload);
   const client = new WebSocket(`${baseUrl}?token=${encodeURIComponent(token)}`);
   clients.push(client);
   const snapshotPromise = waitForMessage(client, (message) => message.type === "room:snapshot");
 
   await waitForOpen(client);
-  await snapshotPromise;
+  const snapshot = await snapshotPromise;
 
-  return client;
+  return { client, snapshot };
 }
 
 function waitForOpen(client: WebSocket): Promise<void> {
@@ -316,13 +348,39 @@ describe("SocketGateway chat protocol", () => {
   it("supersedes an existing socket for the same participant session without leaving the room", async () => {
     const { roomManager, url } = await createTestGateway();
     const first = await connectClient(url, joinPayload("peer_a", "Alice"));
+    const mediaChangedPromise = waitForMessage(first, (message) => message.type === "participant:mediaChanged");
+    const mediaSetResponsePromise = waitForMessage(
+      first,
+      (message) => message.type === "response" && message.requestId === "req_media_on",
+    );
+    first.send(
+      JSON.stringify({
+        type: "media:setState",
+        requestId: "req_media_on",
+        media: { mic: "on", camera: "on", screen: "off" },
+      }),
+    );
+    await mediaSetResponsePromise;
+    await mediaChangedPromise;
+
     const firstClosed = waitForClose(first);
 
-    const second = await connectClient(url, joinPayload("peer_a", "Alice"));
+    const { client: second, snapshot } = await connectClientWithSnapshot(url, joinPayload("peer_a", "Alice"));
     await firstClosed;
 
     expect(roomManager.join).toHaveBeenCalledTimes(2);
     expect(roomManager.leave).not.toHaveBeenCalled();
+    expect(roomManager.releaseParticipantMedia).toHaveBeenCalledWith(room.roomId, "peer_a");
+    expect(snapshot.participants).toMatchObject([
+      {
+        participantId: "peer_a",
+        media: {
+          mic: "off",
+          camera: "off",
+          screen: "off",
+        },
+      },
+    ]);
 
     const responsePromise = waitForMessage(
       second,
