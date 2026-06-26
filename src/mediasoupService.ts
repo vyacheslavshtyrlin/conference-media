@@ -379,6 +379,26 @@ export class MediasoupService {
     return { producerId, source };
   }
 
+  async closeProducersForSource(
+    roomId: string,
+    participantId: string,
+    source: "mic" | "camera" | "screen",
+  ): Promise<string[]> {
+    const room = await this.ensureRoom(roomId);
+    const closedProducerIds: string[] = [];
+
+    for (const [producerId, record] of Array.from(room.producers.entries())) {
+      if (record.participantId !== participantId || record.source !== source) {
+        continue;
+      }
+
+      closedProducerIds.push(producerId);
+      record.producer.close();
+    }
+
+    return closedProducerIds;
+  }
+
   listProducers(roomId: string): Array<{
     producerId: string;
     participantId: string;

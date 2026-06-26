@@ -56,6 +56,17 @@ export class PeerManager {
     return next;
   }
 
+  setCreator(participantId: string, isCreator: boolean): Participant | undefined {
+    const participant = this.participants.get(participantId);
+    if (!participant) {
+      return undefined;
+    }
+
+    const next = { ...participant, isCreator };
+    this.participants.set(participantId, next);
+    return next;
+  }
+
   removePeer(participantId: string): Participant | undefined {
     const participant = this.participants.get(participantId);
     this.participants.delete(participantId);

@@ -286,6 +286,77 @@ export class SocketGateway {
         return;
       }
 
+      case "participant:kick": {
+        this.assertJoined(context);
+        const result = await this.roomManager.kickParticipantByCreator(
+          context.roomId,
+          context.participantId,
+          event.targetParticipantId,
+        );
+        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
+        this.broadcast(context.roomId, {
+          type: "participant:kicked",
+          participantId: result.target.participantId,
+          targetDisplayName: result.target.displayName,
+          actorParticipantId: result.actor.participantId,
+          actorDisplayName: result.actor.displayName,
+        });
+        this.broadcast(context.roomId, {
+          type: "participant:left",
+          participantId: result.target.participantId,
+        });
+        this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        this.closeParticipantSocket(context.roomId, result.target.participantId, "Removed by creator");
+        return;
+      }
+
+      case "participant:disableMedia": {
+        this.assertJoined(context);
+        const result = await this.roomManager.disableParticipantMediaByCreator(
+          context.roomId,
+          context.participantId,
+          event.targetParticipantId,
+          event.source,
+        );
+        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
+        this.broadcast(context.roomId, {
+          type: "participant:mediaControlApplied",
+          participantId: result.target.participantId,
+          targetDisplayName: result.target.displayName,
+          source: event.source,
+          media: result.target.media,
+          actorParticipantId: result.actor.participantId,
+          actorDisplayName: result.actor.displayName,
+        });
+        this.broadcast(context.roomId, {
+          type: "participant:mediaChanged",
+          participantId: result.target.participantId,
+          media: result.target.media,
+        });
+        this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        return;
+      }
+
+      case "participant:grantCreator": {
+        this.assertJoined(context);
+        const result = await this.roomManager.grantCreatorByCreator(
+          context.roomId,
+          context.participantId,
+          event.targetParticipantId,
+        );
+        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
+        this.broadcast(context.roomId, {
+          type: "participant:creatorChanged",
+          participantId: result.target.participantId,
+          targetDisplayName: result.target.displayName,
+          isCreator: result.target.isCreator,
+          actorParticipantId: result.actor.participantId,
+          actorDisplayName: result.actor.displayName,
+        });
+        this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        return;
+      }
+
       case "room:leave": {
         await this.leave(context);
         this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
@@ -474,6 +545,23 @@ export class SocketGateway {
     }
 
     this.roomSockets.delete(roomId);
+  }
+
+  private closeParticipantSocket(roomId: string, participantId: string, reason: string): void {
+    const socket = this.participantSockets.get(this.participantSocketKey(roomId, participantId));
+    if (!socket) {
+      return;
+    }
+
+    const context = this.clients.get(socket);
+    if (context) {
+      context.joined = false;
+      this.removeParticipantSocket(context);
+      this.clients.delete(socket);
+      this.removeRoomSocket(context.roomId, socket);
+    }
+
+    socket.close(1000, reason);
   }
 
   private send(socket: WebSocket, event: ServerWebSocketEvent): void {

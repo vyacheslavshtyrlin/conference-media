@@ -2,6 +2,7 @@ import { CHAT_HISTORY_LIMIT, CHAT_MESSAGE_TEXT_MAX_LENGTH, MAX_ROOM_PARTICIPANTS
 import type {
   ChatMessage,
   MediaKind,
+  MediaSource,
   Participant,
   ParticipantConnectionQuality,
   ParticipantMedia,
@@ -22,6 +23,12 @@ type RuntimeRoomState = {
   metadata: RoomMetadata;
   peers: PeerManager;
   cleanupTimer?: NodeJS.Timeout;
+};
+
+type CreatorControlResult = {
+  actor: Participant;
+  target: Participant;
+  chatMessage: ChatMessage;
 };
 
 export class RoomManager {
@@ -250,6 +257,92 @@ export class RoomManager {
     });
   }
 
+  async kickParticipantByCreator(
+    roomId: string,
+    actorParticipantId: string,
+    targetParticipantId: string,
+  ): Promise<CreatorControlResult> {
+    return this.runExclusive(roomId, async () => {
+      const { state, actor, target } = this.requireCreatorControlTarget(
+        roomId,
+        actorParticipantId,
+        targetParticipantId,
+      );
+
+      this.mediasoup.closePeer(roomId, targetParticipantId);
+      state.peers.removePeer(targetParticipantId);
+      await this.repository.removeParticipant(roomId, targetParticipantId);
+      await this.repository.setRoomSessionCreator(roomId, targetParticipantId, false);
+      const chatMessage = await this.appendSystemChatMessage(
+        roomId,
+        `${actor.displayName} removed ${target.displayName} from the conference`,
+      );
+
+      return { actor, target, chatMessage };
+    });
+  }
+
+  async disableParticipantMediaByCreator(
+    roomId: string,
+    actorParticipantId: string,
+    targetParticipantId: string,
+    source: MediaSource,
+  ): Promise<CreatorControlResult> {
+    return this.runExclusive(roomId, async () => {
+      const { state, actor, target } = this.requireCreatorControlTarget(
+        roomId,
+        actorParticipantId,
+        targetParticipantId,
+      );
+      const nextMedia: ParticipantMedia = {
+        ...target.media,
+        [source]: source === "mic" ? "muted" : "off",
+      };
+
+      await this.mediasoup.closeProducersForSource(roomId, targetParticipantId, source);
+      const nextTarget = state.peers.setMedia(targetParticipantId, nextMedia);
+      if (!nextTarget) {
+        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+      }
+      await this.repository.saveParticipant(roomId, nextTarget);
+
+      const chatMessage = await this.appendSystemChatMessage(
+        roomId,
+        this.getCreatorMediaControlMessage(actor.displayName, target.displayName, source),
+      );
+
+      return { actor, target: nextTarget, chatMessage };
+    });
+  }
+
+  async grantCreatorByCreator(
+    roomId: string,
+    actorParticipantId: string,
+    targetParticipantId: string,
+  ): Promise<CreatorControlResult> {
+    return this.runExclusive(roomId, async () => {
+      const { state, actor, target } = this.requireCreatorControlTarget(
+        roomId,
+        actorParticipantId,
+        targetParticipantId,
+      );
+
+      const nextTarget = state.peers.setCreator(targetParticipantId, true);
+      if (!nextTarget) {
+        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+      }
+
+      await this.repository.saveParticipant(roomId, nextTarget);
+      await this.repository.setRoomSessionCreator(roomId, targetParticipantId, true);
+      const chatMessage = await this.appendSystemChatMessage(
+        roomId,
+        `${actor.displayName} shared creator status with ${target.displayName}`,
+      );
+
+      return { actor, target: nextTarget, chatMessage };
+    });
+  }
+
   listProducers(roomId: string) {
     return this.mediasoup.listProducers(roomId);
   }
@@ -377,6 +470,47 @@ export class RoomManager {
   private assertJoined(roomId: string, participantId: string): void {
     if (!this.getParticipant(roomId, participantId)) {
       throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+    }
+  }
+
+  private requireCreatorControlTarget(
+    roomId: string,
+    actorParticipantId: string,
+    targetParticipantId: string,
+  ): {
+    state: RuntimeRoomState;
+    actor: Participant;
+    target: Participant;
+  } {
+    const state = this.requireRuntimeRoom(roomId);
+    const actor = state.peers.getPeer(actorParticipantId);
+    if (!actor?.isCreator) {
+      throw new SignalingError("INVALID_TOKEN", "Only a creator can manage participants");
+    }
+    if (actorParticipantId === targetParticipantId) {
+      throw new SignalingError("INVALID_PAYLOAD", "Creator controls require another participant");
+    }
+
+    const target = state.peers.getPeer(targetParticipantId);
+    if (!target) {
+      throw new SignalingError("INVALID_PAYLOAD", "Target participant is not joined");
+    }
+
+    return { state, actor, target };
+  }
+
+  private getCreatorMediaControlMessage(
+    actorDisplayName: string,
+    targetDisplayName: string,
+    source: MediaSource,
+  ): string {
+    switch (source) {
+      case "mic":
+        return `${actorDisplayName} muted ${targetDisplayName}'s microphone`;
+      case "camera":
+        return `${actorDisplayName} turned off ${targetDisplayName}'s camera`;
+      case "screen":
+        return `${actorDisplayName} stopped ${targetDisplayName}'s screen share`;
     }
   }
 

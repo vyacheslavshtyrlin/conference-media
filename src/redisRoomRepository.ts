@@ -14,6 +14,7 @@ export type RedisClient = {
   get(key: string): Promise<string | null>;
   set(key: string, value: string): Promise<string | null>;
   hExists(key: string, field: string): Promise<boolean | number>;
+  hGet(key: string, field: string): Promise<string | null>;
   hLen(key: string): Promise<number>;
   hSet(key: string, field: string, value: string): Promise<number>;
   hDel(key: string, field: string): Promise<number>;
@@ -85,6 +86,27 @@ export class RedisRoomRepository {
     const key = this.participantsKey(roomId);
 
     await this.redis.hSet(key, participant.participantId, JSON.stringify(participantSchema.parse(participant)));
+  }
+
+  async setRoomSessionCreator(roomId: string, participantId: string, isCreator: boolean): Promise<void> {
+    const key = this.roomSessionsKey(roomId);
+    const raw = await this.redis.hGet(key, participantId);
+    if (!raw) {
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw) as unknown;
+    } catch {
+      return;
+    }
+
+    if (!isRoomSessionRecord(parsed)) {
+      return;
+    }
+
+    await this.redis.hSet(key, participantId, JSON.stringify({ ...parsed, isCreator }));
   }
 
   async removeParticipant(roomId: string, participantId: string): Promise<void> {
@@ -178,4 +200,28 @@ export class RedisRoomRepository {
   private roomSessionsKey(roomId: string): string {
     return `room:${roomId}:sessions`;
   }
+}
+
+function isRoomSessionRecord(value: unknown): value is {
+  participantId: string;
+  displayName: string | null;
+  isCreator: boolean;
+  tokenHash: string;
+  createdAt: string;
+} {
+  if (typeof value !== "object" || value === null) {
+    return false;
+  }
+
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.participantId === "string" &&
+    record.participantId.length > 0 &&
+    (record.displayName === null || typeof record.displayName === "string") &&
+    typeof record.isCreator === "boolean" &&
+    typeof record.tokenHash === "string" &&
+    record.tokenHash.length > 0 &&
+    typeof record.createdAt === "string" &&
+    !Number.isNaN(Date.parse(record.createdAt))
+  );
 }

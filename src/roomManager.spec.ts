@@ -1,5 +1,5 @@
 import type { ChatMessage, Participant, RoomClosedReason, RoomMetadata } from "#contracts";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type { MediasoupService } from "./mediasoupService.js";
 import type { RedisRoomRepository } from "./redisRoomRepository.js";
@@ -50,6 +50,8 @@ class FakeRepository {
     this.participants.set(participant.participantId, participant);
   }
 
+  async setRoomSessionCreator(): Promise<void> {}
+
   async removeParticipant(_roomId: string, participantId: string): Promise<void> {
     this.participants.delete(participantId);
   }
@@ -98,6 +100,7 @@ class FakeMediasoupService {
   ensureRoomCalls = 0;
   closeRoomCalls = 0;
   closePeerCalls = 0;
+  closeProducersForSourceCalls: Array<{ participantId: string; source: string }> = [];
   private roomDeadCallback?: (roomId: string, reason: RoomClosedReason) => void;
 
   setRoomDeadCallback(callback: (roomId: string, reason: RoomClosedReason) => void): void {
@@ -116,6 +119,11 @@ class FakeMediasoupService {
 
   closePeer(): string[] {
     this.closePeerCalls += 1;
+    return [];
+  }
+
+  async closeProducersForSource(_roomId: string, participantId: string, source: "mic" | "camera" | "screen"): Promise<string[]> {
+    this.closeProducersForSourceCalls.push({ participantId, source });
     return [];
   }
 
@@ -352,6 +360,124 @@ describe("RoomManager", () => {
     expect(repository.room.status).toBe("closed");
     expect(repository.closedReason).toBe("closed_by_creator");
     expect(mediasoup.closeRoomCalls).toBe(1);
+  });
+
+  it("allows a creator to disable another participant's microphone", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createCreatorPayload("peer_creator"));
+    await manager.join(createPayload("peer_guest"));
+    await manager.setMedia(room.roomId, "peer_guest", {
+      mic: "on",
+      camera: "on",
+      screen: "off",
+    });
+
+    const result = await manager.disableParticipantMediaByCreator(
+      room.roomId,
+      "peer_creator",
+      "peer_guest",
+      "mic",
+    );
+
+    expect(result.target.media).toMatchObject({ mic: "muted", camera: "on", screen: "off" });
+    expect(repository.participants.get("peer_guest")?.media.mic).toBe("muted");
+    expect(mediasoup.closeProducersForSourceCalls).toEqual([{ participantId: "peer_guest", source: "mic" }]);
+    expect(result.chatMessage).toMatchObject({ kind: "system" });
+  });
+
+  it("allows a creator to grant creator status to another participant", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const setRoomSessionCreator = vi.spyOn(repository, "setRoomSessionCreator");
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createCreatorPayload("peer_creator"));
+    await manager.join(createPayload("peer_guest"));
+
+    const result = await manager.grantCreatorByCreator(room.roomId, "peer_creator", "peer_guest");
+
+    expect(result.target.isCreator).toBe(true);
+    expect(repository.participants.get("peer_guest")?.isCreator).toBe(true);
+    expect(setRoomSessionCreator).toHaveBeenCalledWith(room.roomId, "peer_guest", true);
+  });
+
+  it("allows a creator to kick another participant", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const setRoomSessionCreator = vi.spyOn(repository, "setRoomSessionCreator");
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createCreatorPayload("peer_creator"));
+    await manager.join(createPayload("peer_guest"));
+
+    const result = await manager.kickParticipantByCreator(room.roomId, "peer_creator", "peer_guest");
+
+    expect(result.target.participantId).toBe("peer_guest");
+    expect(repository.participants.has("peer_guest")).toBe(false);
+    expect(manager.getParticipants(room.roomId).map((participant) => participant.participantId)).toEqual([
+      "peer_creator",
+    ]);
+    expect(mediasoup.closePeerCalls).toBe(1);
+    expect(setRoomSessionCreator).toHaveBeenCalledWith(room.roomId, "peer_guest", false);
+  });
+
+  it("resets a granted creator room session when the participant is kicked", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const setRoomSessionCreator = vi.spyOn(repository, "setRoomSessionCreator");
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createCreatorPayload("peer_creator"));
+    await manager.join(createPayload("peer_guest"));
+    await manager.grantCreatorByCreator(room.roomId, "peer_creator", "peer_guest");
+    setRoomSessionCreator.mockClear();
+
+    await manager.kickParticipantByCreator(room.roomId, "peer_creator", "peer_guest");
+
+    expect(setRoomSessionCreator).toHaveBeenCalledTimes(1);
+    expect(setRoomSessionCreator).toHaveBeenCalledWith(room.roomId, "peer_guest", false);
+  });
+
+  it("rejects participant management from non-creator participants", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createPayload("peer_a"));
+    await manager.join(createPayload("peer_b"));
+
+    await expect(
+      manager.disableParticipantMediaByCreator(room.roomId, "peer_a", "peer_b", "mic"),
+    ).rejects.toMatchObject({ code: "INVALID_TOKEN" });
+    await expect(
+      manager.grantCreatorByCreator(room.roomId, "peer_a", "peer_b"),
+    ).rejects.toMatchObject({ code: "INVALID_TOKEN" });
+    await expect(
+      manager.kickParticipantByCreator(room.roomId, "peer_a", "peer_b"),
+    ).rejects.toMatchObject({ code: "INVALID_TOKEN" });
   });
 
   it("marks a room closed with media_server_error when the mediasoup room dies", async () => {

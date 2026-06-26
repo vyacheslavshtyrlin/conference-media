@@ -136,6 +136,80 @@ function createRoomManagerMock() {
       participants.set(participantId, next);
       return next;
     }),
+    kickParticipantByCreator: vi.fn(async (_roomId: string, actorParticipantId: string, targetParticipantId: string) => {
+      const actor = participants.get(actorParticipantId);
+      const target = participants.get(targetParticipantId);
+      if (!actor?.isCreator) {
+        throw new SignalingError("INVALID_TOKEN", "Only a creator can manage participants");
+      }
+      if (!target) {
+        throw new SignalingError("INVALID_PAYLOAD", "Target participant is not joined");
+      }
+      participants.delete(targetParticipantId);
+      return {
+        actor,
+        target,
+        chatMessage: {
+          messageId: "msg_kick",
+          roomId: room.roomId,
+          kind: "system" as const,
+          text: `${actor.displayName} removed ${target.displayName}`,
+          createdAt,
+        },
+      };
+    }),
+    disableParticipantMediaByCreator: vi.fn(async (_roomId: string, actorParticipantId: string, targetParticipantId: string, source: "mic" | "camera" | "screen") => {
+      const actor = participants.get(actorParticipantId);
+      const target = participants.get(targetParticipantId);
+      if (!actor?.isCreator) {
+        throw new SignalingError("INVALID_TOKEN", "Only a creator can manage participants");
+      }
+      if (!target) {
+        throw new SignalingError("INVALID_PAYLOAD", "Target participant is not joined");
+      }
+      const next = {
+        ...target,
+        media: {
+          ...target.media,
+          [source]: source === "mic" ? "muted" : "off",
+        },
+      } satisfies Participant;
+      participants.set(targetParticipantId, next);
+      return {
+        actor,
+        target: next,
+        chatMessage: {
+          messageId: "msg_media_control",
+          roomId: room.roomId,
+          kind: "system" as const,
+          text: `${actor.displayName} changed ${target.displayName}`,
+          createdAt,
+        },
+      };
+    }),
+    grantCreatorByCreator: vi.fn(async (_roomId: string, actorParticipantId: string, targetParticipantId: string) => {
+      const actor = participants.get(actorParticipantId);
+      const target = participants.get(targetParticipantId);
+      if (!actor?.isCreator) {
+        throw new SignalingError("INVALID_TOKEN", "Only a creator can manage participants");
+      }
+      if (!target) {
+        throw new SignalingError("INVALID_PAYLOAD", "Target participant is not joined");
+      }
+      const next = { ...target, isCreator: true } satisfies Participant;
+      participants.set(targetParticipantId, next);
+      return {
+        actor,
+        target: next,
+        chatMessage: {
+          messageId: "msg_creator",
+          roomId: room.roomId,
+          kind: "system" as const,
+          text: `${actor.displayName} shared creator status`,
+          createdAt,
+        },
+      };
+    }),
     closeRoomByCreator: vi.fn(),
   });
 }
@@ -469,6 +543,164 @@ describe("SocketGateway chat protocol", () => {
       quality: "poor",
     });
     expect(roomManager.setConnectionQuality).toHaveBeenCalledWith(room.roomId, "peer_a", "poor");
+  });
+
+  it("lets the creator disable another participant's media and broadcasts the control event", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, creatorPayload("peer_creator", "Alice"));
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+
+    bob.send(
+      JSON.stringify({
+        type: "media:setState",
+        requestId: "bob_media_on",
+        media: { mic: "on", camera: "on", screen: "off" },
+      }),
+    );
+    await waitForMessage(alice, (message) => message.type === "participant:mediaChanged");
+
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "disable_mic",
+    );
+    const controlPromise = waitForMessage(
+      bob,
+      (message) => message.type === "participant:mediaControlApplied",
+    );
+
+    alice.send(
+      JSON.stringify({
+        type: "participant:disableMedia",
+        requestId: "disable_mic",
+        targetParticipantId: "peer_b",
+        source: "mic",
+      }),
+    );
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "disable_mic",
+      ok: true,
+    });
+    await expect(controlPromise).resolves.toMatchObject({
+      type: "participant:mediaControlApplied",
+      participantId: "peer_b",
+      targetDisplayName: "Bob",
+      source: "mic",
+      actorParticipantId: "peer_creator",
+      actorDisplayName: "Alice",
+      media: { mic: "muted", camera: "on", screen: "off" },
+    });
+    expect(roomManager.disableParticipantMediaByCreator).toHaveBeenCalledWith(
+      room.roomId,
+      "peer_creator",
+      "peer_b",
+      "mic",
+    );
+  });
+
+  it("lets the creator share creator status", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, creatorPayload("peer_creator", "Alice"));
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "grant_creator",
+    );
+    const grantPromise = waitForMessage(
+      bob,
+      (message) => message.type === "participant:creatorChanged",
+    );
+
+    alice.send(
+      JSON.stringify({
+        type: "participant:grantCreator",
+        requestId: "grant_creator",
+        targetParticipantId: "peer_b",
+      }),
+    );
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "grant_creator",
+      ok: true,
+    });
+    await expect(grantPromise).resolves.toMatchObject({
+      type: "participant:creatorChanged",
+      participantId: "peer_b",
+      targetDisplayName: "Bob",
+      isCreator: true,
+      actorParticipantId: "peer_creator",
+      actorDisplayName: "Alice",
+    });
+    expect(roomManager.grantCreatorByCreator).toHaveBeenCalledWith(room.roomId, "peer_creator", "peer_b");
+  });
+
+  it("lets the creator kick another participant and closes the target socket", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, creatorPayload("peer_creator", "Alice"));
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "kick_bob",
+    );
+    const kickedPromise = waitForMessage(
+      bob,
+      (message) => message.type === "participant:kicked",
+    );
+    const bobClosed = waitForClose(bob);
+
+    alice.send(
+      JSON.stringify({
+        type: "participant:kick",
+        requestId: "kick_bob",
+        targetParticipantId: "peer_b",
+      }),
+    );
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "kick_bob",
+      ok: true,
+    });
+    await expect(kickedPromise).resolves.toMatchObject({
+      type: "participant:kicked",
+      participantId: "peer_b",
+      targetDisplayName: "Bob",
+      actorParticipantId: "peer_creator",
+      actorDisplayName: "Alice",
+    });
+    await bobClosed;
+    expect(roomManager.kickParticipantByCreator).toHaveBeenCalledWith(room.roomId, "peer_creator", "peer_b");
+    expect(roomManager.leave).not.toHaveBeenCalledWith(room.roomId, "peer_b");
+  });
+
+  it("rejects participant management from non-creators", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, joinPayload("peer_a", "Alice"));
+    await connectClient(url, joinPayload("peer_b", "Bob"));
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "bad_kick",
+    );
+
+    alice.send(
+      JSON.stringify({
+        type: "participant:kick",
+        requestId: "bad_kick",
+        targetParticipantId: "peer_b",
+      }),
+    );
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "bad_kick",
+      ok: false,
+      error: {
+        code: "INVALID_TOKEN",
+      },
+    });
+    expect(roomManager.kickParticipantByCreator).toHaveBeenCalledWith(room.roomId, "peer_a", "peer_b");
   });
 
   it("rejects chat text above the configured maximum length", async () => {
