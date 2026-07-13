@@ -1,5 +1,5 @@
 import * as mediasoup from "mediasoup";
-import type { CreateWebRtcTransportResponseData, RoomClosedReason } from "#contracts";
+import type { CreateWebRtcTransportResponseData, ParticipantMedia, RoomClosedReason } from "#contracts";
 import type {
   Consumer,
   DtlsParameters,
@@ -68,8 +68,9 @@ const ACTIVE_SPEAKER_INTERVAL_MS = 800;
 
 export class MediasoupService {
   private readonly rooms = new Map<string, RuntimeRoom>();
-  private workers: Worker[] = [];
+  private workers: Array<Worker | undefined> = [];
   private nextWorkerIndex = 0;
+  private closing = false;
   private onRoomDeadCallback?: (roomId: string, reason: RoomClosedReason) => void;
   private onActiveSpeakerChangedCallback?: (roomId: string, participantId: string | null) => void;
 
@@ -88,38 +89,21 @@ export class MediasoupService {
 
   async init(): Promise<void> {
     const count = this.config.numWorkers;
-    const workers = await Promise.all(
-      Array.from({ length: count }, () =>
-        mediasoup.createWorker({
-          rtcMinPort: this.config.rtcMinPort,
-          rtcMaxPort: this.config.rtcMaxPort,
-        }),
-      ),
-    );
-
-    for (const [index, worker] of workers.entries()) {
-      worker.on("died", () => {
-        this.logger?.error("mediasoup worker died", { workerIndex: index });
-        for (const [roomId, room] of [...this.rooms.entries()]) {
-          if (room.workerIndex === index) {
-            this.closeDeadRoom(roomId, "media_server_error");
-          }
-        }
-      });
-    }
-
-    this.workers = workers;
-    this.logger?.info("mediasoup worker pool ready", { count });
+    this.closing = false;
+    this.workers = Array.from({ length: count });
+    await Promise.all(Array.from({ length: count }, (_, index) => this.createWorkerAt(index)));
+    this.logger?.info("mediasoup worker pool ready", { count: this.getUsableWorkerCount() });
   }
 
   closeAll(): void {
+    this.closing = true;
     // Notify RoomManager (and through it SocketGateway) for every live room so
     // Redis participant records are cleaned up even on graceful shutdown.
     for (const roomId of [...this.rooms.keys()]) {
       this.closeDeadRoom(roomId, "server_shutdown");
     }
     for (const worker of this.workers) {
-      worker.close();
+      worker?.close();
     }
     this.workers = [];
   }
@@ -130,11 +114,10 @@ export class MediasoupService {
       return existing;
     }
 
-    const workerIndex = this.nextWorkerIndex % this.workers.length;
-    this.nextWorkerIndex += 1;
-    const worker = this.workers[workerIndex];
+    const workerIndex = this.findNextWorkerIndex();
+    const worker = workerIndex === undefined ? undefined : this.workers[workerIndex];
 
-    if (!worker) {
+    if (workerIndex === undefined || !worker) {
       throw new SignalingError("MEDIASOUP_ERROR", "Mediasoup worker pool is not initialized");
     }
 
@@ -258,6 +241,13 @@ export class MediasoupService {
         "Peer already has an active producer for this source",
       );
     }
+    const exclusiveVideoSource = source === "camera" ? "screen" : source === "screen" ? "camera" : null;
+    if (exclusiveVideoSource && this.hasProducerForSource(room, participantId, exclusiveVideoSource)) {
+      throw new SignalingError(
+        "MEDIASOUP_ERROR",
+        "Peer cannot publish camera and screen at the same time",
+      );
+    }
     if (source === "screen" && this.hasActiveScreenProducer(room)) {
       throw new SignalingError(
         "MEDIASOUP_ERROR",
@@ -379,6 +369,26 @@ export class MediasoupService {
     return { producerId, source };
   }
 
+  async setProducerPaused(
+    roomId: string,
+    participantId: string,
+    producerId: string,
+    paused: boolean,
+  ): Promise<{ producerId: string; source: "mic" | "camera" | "screen" }> {
+    const room = await this.ensureRoom(roomId);
+    const record = room.producers.get(producerId);
+    if (!record || record.participantId !== participantId) {
+      throw new SignalingError("PRODUCER_NOT_FOUND", "Producer not found");
+    }
+
+    if (paused) {
+      await record.producer.pause();
+    } else {
+      await record.producer.resume();
+    }
+    return { producerId, source: record.source };
+  }
+
   async closeProducersForSource(
     roomId: string,
     participantId: string,
@@ -416,6 +426,25 @@ export class MediasoupService {
       kind: record.producer.kind,
       source: record.source,
     }));
+  }
+
+  getParticipantMedia(roomId: string, participantId: string): ParticipantMedia {
+    const room = this.rooms.get(roomId);
+    const media: ParticipantMedia = { mic: "off", camera: "off", screen: "off" };
+    if (!room) {
+      return media;
+    }
+
+    for (const record of room.producers.values()) {
+      if (record.participantId !== participantId) continue;
+      if (!record.producer.paused) {
+        media[record.source] = "on";
+      } else if (record.source === "mic") {
+        media.mic = "muted";
+      }
+    }
+
+    return media;
   }
 
   getActiveSpeakerParticipantId(roomId: string): string | null {
@@ -480,7 +509,7 @@ export class MediasoupService {
 
     return {
       rooms: this.rooms.size,
-      workers: this.workers.length,
+      workers: this.getUsableWorkerCount(),
       transports,
       producers,
       consumers,
@@ -488,7 +517,7 @@ export class MediasoupService {
   }
 
   isReady(): boolean {
-    return this.workers.length > 0;
+    return this.getUsableWorkerCount() > 0;
   }
 
   private async getTransport(
@@ -582,5 +611,68 @@ export class MediasoupService {
     room.consumers.clear();
     this.rooms.delete(roomId);
     this.onRoomDeadCallback?.(roomId, reason);
+  }
+
+  private async createWorkerAt(index: number): Promise<void> {
+    try {
+      const worker = await mediasoup.createWorker({
+        rtcMinPort: this.config.rtcMinPort,
+        rtcMaxPort: this.config.rtcMaxPort,
+      });
+      worker.on("died", () => {
+        void this.handleWorkerDeath(index, worker);
+      });
+      this.workers[index] = worker;
+    } catch (error) {
+      this.workers[index] = undefined;
+      this.logger?.error("mediasoup worker replacement failed", {
+        workerIndex: index,
+        error: String(error),
+      });
+      throw error;
+    }
+  }
+
+  private async handleWorkerDeath(index: number, worker: Worker): Promise<void> {
+    if (this.closing || this.workers[index] !== worker) {
+      return;
+    }
+
+    this.logger?.error("mediasoup worker died", { workerIndex: index });
+    this.workers[index] = undefined;
+    for (const [roomId, room] of [...this.rooms.entries()]) {
+      if (room.workerIndex === index) {
+        this.closeDeadRoom(roomId, "media_server_error");
+      }
+    }
+    try {
+      await this.createWorkerAt(index);
+      this.logger?.info("mediasoup worker replaced", {
+        workerIndex: index,
+        usableWorkers: this.getUsableWorkerCount(),
+      });
+    } catch {
+      // createWorkerAt emits the structured failure and readiness stays false if no worker remains.
+    }
+  }
+
+  private findNextWorkerIndex(): number | undefined {
+    if (this.workers.length === 0) {
+      return undefined;
+    }
+
+    for (let offset = 0; offset < this.workers.length; offset += 1) {
+      const index = (this.nextWorkerIndex + offset) % this.workers.length;
+      if (this.workers[index]) {
+        this.nextWorkerIndex = (index + 1) % this.workers.length;
+        return index;
+      }
+    }
+
+    return undefined;
+  }
+
+  private getUsableWorkerCount(): number {
+    return this.workers.filter((worker) => worker !== undefined).length;
   }
 }

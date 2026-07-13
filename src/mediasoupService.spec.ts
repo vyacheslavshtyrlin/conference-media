@@ -202,6 +202,28 @@ describe("MediasoupService", () => {
     ).resolves.toMatchObject({ id: expect.stringMatching(/^producer_/) });
   });
 
+  it("prevents one peer from publishing camera and screen at the same time", async () => {
+    const service = await createService();
+    const cameraFirstTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const screenFirstTransport = await service.createWebRtcTransport("room_2", "peer_2", "send");
+
+    await service.produce("room_1", "peer_1", cameraFirstTransport.id, "video", {}, "camera", () => {});
+
+    await expect(
+      service.produce("room_1", "peer_1", cameraFirstTransport.id, "video", {}, "screen", () => {}),
+    ).rejects.toMatchObject(
+      new SignalingError("MEDIASOUP_ERROR", "Peer cannot publish camera and screen at the same time"),
+    );
+
+    await service.produce("room_2", "peer_2", screenFirstTransport.id, "video", {}, "screen", () => {});
+
+    await expect(
+      service.produce("room_2", "peer_2", screenFirstTransport.id, "video", {}, "camera", () => {}),
+    ).rejects.toMatchObject(
+      new SignalingError("MEDIASOUP_ERROR", "Peer cannot publish camera and screen at the same time"),
+    );
+  });
+
   it("releases the screen share slot when the active producer is closed", async () => {
     const service = await createService();
     const firstTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
@@ -228,5 +250,37 @@ describe("MediasoupService", () => {
     fakeAudioLevelObservers[0]?.emit("silence");
 
     expect(changes).toEqual(["peer_1", null]);
+  });
+
+  it("removes a dead worker from readiness, closes its rooms and replaces it", async () => {
+    const firstWorker = createFakeWorker();
+    const replacementWorker = createFakeWorker();
+    createWorker.mockReset();
+    createWorker.mockResolvedValueOnce(firstWorker).mockResolvedValueOnce(replacementWorker);
+    const service = await createService();
+    const closedRooms: string[] = [];
+    service.setRoomDeadCallback((roomId) => closedRooms.push(roomId));
+    await service.ensureRoom("room_1");
+
+    firstWorker.emit("died");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(closedRooms).toEqual(["room_1"]);
+    expect(createWorker).toHaveBeenCalledTimes(2);
+    expect(service.getRuntimeStats().workers).toBe(1);
+    expect(service.isReady()).toBe(true);
+  });
+
+  it("becomes unready when a dead worker cannot be replaced", async () => {
+    const firstWorker = createFakeWorker();
+    createWorker.mockReset();
+    createWorker.mockResolvedValueOnce(firstWorker).mockRejectedValueOnce(new Error("replacement failed"));
+    const service = await createService();
+
+    firstWorker.emit("died");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(service.getRuntimeStats().workers).toBe(0);
+    expect(service.isReady()).toBe(false);
   });
 });

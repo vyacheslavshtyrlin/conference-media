@@ -8,6 +8,11 @@ export type SignalingConfig = {
   redisUrl: string;
   joinTokenSecret: string;
   roomEmptyGraceMs: number;
+  shutdownTimeoutMs: number;
+  mediaLease: {
+    ttlMs: number;
+    refreshMs: number;
+  };
   websocket: {
     heartbeatIntervalMs: number;
     maxPayloadBytes: number;
@@ -40,6 +45,11 @@ export function readSignalingConfig(): SignalingConfig {
       "change-me-for-local-development",
     ),
     roomEmptyGraceMs: readNumberEnv("ROOM_EMPTY_GRACE_MS", 60_000),
+    shutdownTimeoutMs: readPositiveNumberEnv("SHUTDOWN_TIMEOUT_MS", 10_000),
+    mediaLease: {
+      ttlMs: readPositiveNumberEnv("MEDIA_LEASE_TTL_MS", 15_000),
+      refreshMs: readPositiveNumberEnv("MEDIA_LEASE_REFRESH_MS", 5_000),
+    },
     websocket: {
       heartbeatIntervalMs: readPositiveNumberEnv(
         "WS_HEARTBEAT_INTERVAL_MS",

@@ -42,6 +42,8 @@ WebSocket: heartbeat, max payload, backpressure, rate limit, проверка or
 | `MEDIA_REDIS_URL` / `REDIS_URL` | Redis внутри compose / для внешнего запуска. |
 | `JOIN_TOKEN_SECRET` | Секрет проверки join-токена. **Должен совпадать** с `conference-be`. |
 | `ROOM_EMPTY_GRACE_MS` | Задержка очистки пустой комнаты (по умолчанию `10000`). |
+| `MEDIA_LEASE_TTL_MS` / `MEDIA_LEASE_REFRESH_MS` | TTL и refresh интервал single-node media lease (`15000` / `5000` ms); lease связывает Redis live participants с текущим signaling process. |
+| `SHUTDOWN_TIMEOUT_MS` | Bounded graceful-shutdown timeout (`10000` ms); после него runtime закрывается принудительно. |
 | `WS_HEARTBEAT_INTERVAL_MS` | Интервал heartbeat (по умолчанию `30000`). |
 | `WS_MAX_PAYLOAD_BYTES` | Максимум размера WS-сообщения (по умолчанию `65536`). |
 | `WS_SEND_BACKPRESSURE_BYTES` | Порог backpressure отправки (по умолчанию `262144`). |
@@ -80,7 +82,7 @@ WebSocket: heartbeat, max payload, backpressure, rate limit, проверка or
 | `roomManager.ts` | `RoomManager` — lifecycle комнат: join/leave, медиа-операции (transport/produce/consume/closeProducer), смена media state и качества связи, чат, закрытие комнаты создателем, cleanup пустой комнаты по grace-TTL. Мьютексы на комнату. |
 | `peerManager.ts` | `PeerManager` — состояние участников комнаты в памяти (добавление, media, connectionQuality, удаление, список). |
 | `mediasoupService.ts` | `MediasoupService` — mediasoup runtime: workers, routers, WebRTC-транспортов (send/recv), producers, consumers, `AudioLevelObserver` (active speaker), лимиты на peer, обработка смерти комнаты. |
-| `redisRoomRepository.ts` | `RedisRoomRepository` — персистентное состояние комнат: метаданные, live-участники, чат, capacity/TTL/empty/close. Только сериализуемые данные (runtime-объекты mediasoup в Redis не хранятся). |
+| `redisRoomRepository.ts` | `RedisRoomRepository` — персистентное состояние комнат: метаданные, live-участники, чат, TTL/empty/close. Только сериализуемые данные (runtime-объекты mediasoup в Redis не хранятся). |
 
 ### Спецификации
 | Файл | Что делает |

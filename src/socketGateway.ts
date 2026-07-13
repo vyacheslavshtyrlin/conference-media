@@ -68,15 +68,29 @@ export class SocketGateway {
     }, this.config.heartbeatIntervalMs);
   }
 
-  stop(): void {
+  async stop(): Promise<void> {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
     }
 
-    for (const context of this.clients.values()) {
+    for (const context of [...this.clients.values()]) {
+      context.joined = false;
+      this.removeRoomSocket(context.roomId, context.socket);
+      this.removeParticipantSocket(context);
       context.socket.close(1001, "Server shutting down");
     }
+    this.clients.clear();
+    this.roomSockets.clear();
+    this.participantSockets.clear();
+  }
+
+  forceClose(): void {
+    for (const context of this.clients.values()) {
+      context.joined = false;
+      context.socket.terminate();
+    }
+    this.clients.clear();
     this.roomSockets.clear();
     this.participantSockets.clear();
   }
@@ -106,7 +120,13 @@ export class SocketGateway {
         void this.handleMessage(context, raw);
       });
       socket.on("close", () => {
-        void this.handleDisconnect(context);
+        void this.handleDisconnect(context).catch((error: unknown) => {
+          this.logger.warn("websocket disconnect cleanup failed", {
+            roomId: context.roomId,
+            participantId: context.participantId,
+            error: String(error),
+          });
+        });
       });
       socket.on("error", (error) => {
         this.logger.warn("websocket error", { error: error.message, participantId: context.participantId });
@@ -222,16 +242,31 @@ export class SocketGateway {
           event.kind,
           event.rtpParameters,
           event.appData.source,
-          (producerId) => {
+          ({ producerId, source, participant }) => {
+            this.broadcast(context.roomId, {
+              type: "participant:mediaChanged",
+              participantId: participant.participantId,
+              media: participant.media,
+            });
             this.broadcast(context.roomId, {
               type: "producer:closed",
               producerId,
               participantId: context.participantId,
-              source: event.appData.source,
+              source,
             });
           },
         );
-        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data });
+        this.send(context.socket, {
+          type: "response",
+          requestId: event.requestId,
+          ok: true,
+          data: { id: data.id },
+        });
+        this.broadcast(context.roomId, {
+          type: "participant:mediaChanged",
+          participantId: data.participant.participantId,
+          media: data.participant.media,
+        });
         this.broadcast(context.roomId, {
           type: "producer:added",
           producerId: data.id,
@@ -255,18 +290,38 @@ export class SocketGateway {
       }
 
       case "mediasoup:closeProducer": {
-        await this.roomManager.closeProducer(context.roomId, context.participantId, event.producerId);
-        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
-        return;
-      }
-
-      case "media:setState": {
-        const participant = await this.roomManager.setMedia(context.roomId, context.participantId, event.media);
+        const closed = await this.roomManager.closeProducer(
+          context.roomId,
+          context.participantId,
+          event.producerId,
+        );
         this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
         this.broadcast(context.roomId, {
           type: "participant:mediaChanged",
-          participantId: participant.participantId,
-          media: participant.media,
+          participantId: closed.participant.participantId,
+          media: closed.participant.media,
+        });
+        this.broadcast(context.roomId, {
+          type: "producer:closed",
+          producerId: closed.producerId,
+          participantId: context.participantId,
+          source: closed.source,
+        });
+        return;
+      }
+
+      case "mediasoup:setProducerPaused": {
+        const result = await this.roomManager.setProducerPaused(
+          context.roomId,
+          context.participantId,
+          event.producerId,
+          event.paused,
+        );
+        this.send(context.socket, { type: "response", requestId: event.requestId, ok: true, data: {} });
+        this.broadcast(context.roomId, {
+          type: "participant:mediaChanged",
+          participantId: result.participant.participantId,
+          media: result.participant.media,
         });
         return;
       }
@@ -305,7 +360,9 @@ export class SocketGateway {
           type: "participant:left",
           participantId: result.target.participantId,
         });
-        this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        if (result.chatMessage) {
+          this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        }
         this.closeParticipantSocket(context.roomId, result.target.participantId, "Removed by creator");
         return;
       }
@@ -333,7 +390,17 @@ export class SocketGateway {
           participantId: result.target.participantId,
           media: result.target.media,
         });
-        this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        for (const producerId of result.closedProducerIds ?? []) {
+          this.broadcast(context.roomId, {
+            type: "producer:closed",
+            producerId,
+            participantId: result.target.participantId,
+            source: event.source,
+          });
+        }
+        if (result.chatMessage) {
+          this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        }
         return;
       }
 
@@ -353,7 +420,9 @@ export class SocketGateway {
           actorParticipantId: result.actor.participantId,
           actorDisplayName: result.actor.displayName,
         });
-        this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        if (result.chatMessage) {
+          this.broadcast(context.roomId, { type: "chat:messageAdded", message: result.chatMessage });
+        }
         return;
       }
 

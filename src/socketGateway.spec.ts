@@ -118,15 +118,7 @@ function createRoomManagerMock() {
     produce: vi.fn(),
     consume: vi.fn(),
     closeProducer: vi.fn(),
-    setMedia: vi.fn(async (_roomId: string, participantId: string, media: Participant["media"]) => {
-      const participant = participants.get(participantId);
-      if (!participant) {
-        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
-      }
-      const next = { ...participant, media };
-      participants.set(participantId, next);
-      return next;
-    }),
+    setProducerPaused: vi.fn(),
     setConnectionQuality: vi.fn(async (_roomId: string, participantId: string, quality: Participant["connectionQuality"]) => {
       const participant = participants.get(participantId);
       if (!participant) {
@@ -171,13 +163,14 @@ function createRoomManagerMock() {
         ...target,
         media: {
           ...target.media,
-          [source]: source === "mic" ? "muted" : "off",
+          [source]: "off",
         },
       } satisfies Participant;
       participants.set(targetParticipantId, next);
       return {
         actor,
         target: next,
+        closedProducerIds: [`producer_${source}`],
         chatMessage: {
           messageId: "msg_media_control",
           roomId: room.roomId,
@@ -422,21 +415,6 @@ describe("SocketGateway chat protocol", () => {
   it("supersedes an existing socket for the same participant session without leaving the room", async () => {
     const { roomManager, url } = await createTestGateway();
     const first = await connectClient(url, joinPayload("peer_a", "Alice"));
-    const mediaChangedPromise = waitForMessage(first, (message) => message.type === "participant:mediaChanged");
-    const mediaSetResponsePromise = waitForMessage(
-      first,
-      (message) => message.type === "response" && message.requestId === "req_media_on",
-    );
-    first.send(
-      JSON.stringify({
-        type: "media:setState",
-        requestId: "req_media_on",
-        media: { mic: "on", camera: "on", screen: "off" },
-      }),
-    );
-    await mediaSetResponsePromise;
-    await mediaChangedPromise;
-
     const firstClosed = waitForClose(first);
 
     const { client: second, snapshot } = await connectClientWithSnapshot(url, joinPayload("peer_a", "Alice"));
@@ -550,15 +528,6 @@ describe("SocketGateway chat protocol", () => {
     const alice = await connectClient(url, creatorPayload("peer_creator", "Alice"));
     const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
 
-    bob.send(
-      JSON.stringify({
-        type: "media:setState",
-        requestId: "bob_media_on",
-        media: { mic: "on", camera: "on", screen: "off" },
-      }),
-    );
-    await waitForMessage(alice, (message) => message.type === "participant:mediaChanged");
-
     const responsePromise = waitForMessage(
       alice,
       (message) => message.type === "response" && message.requestId === "disable_mic",
@@ -589,7 +558,7 @@ describe("SocketGateway chat protocol", () => {
       source: "mic",
       actorParticipantId: "peer_creator",
       actorDisplayName: "Alice",
-      media: { mic: "muted", camera: "on", screen: "off" },
+        media: { mic: "off", camera: "off", screen: "off" },
     });
     expect(roomManager.disableParticipantMediaByCreator).toHaveBeenCalledWith(
       room.roomId,
@@ -597,6 +566,41 @@ describe("SocketGateway chat protocol", () => {
       "peer_b",
       "mic",
     );
+  });
+
+  it("does not publish creator media-control success when the target producer cannot be closed", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, creatorPayload("peer_creator", "Alice"));
+    const bob = await connectClient(url, joinPayload("peer_b", "Bob"));
+    const receivedByBob: JsonMessage[] = [];
+    bob.on("message", (raw) => receivedByBob.push(JSON.parse(raw.toString()) as JsonMessage));
+    roomManager.disableParticipantMediaByCreator.mockRejectedValueOnce(
+      new SignalingError("INVALID_PAYLOAD", "Target producer is no longer available"),
+    );
+
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "disable_failed",
+    );
+    alice.send(JSON.stringify({
+      type: "participant:disableMedia",
+      requestId: "disable_failed",
+      targetParticipantId: "peer_b",
+      source: "mic",
+    }));
+
+    await expect(responsePromise).resolves.toMatchObject({
+      type: "response",
+      requestId: "disable_failed",
+      ok: false,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(
+      receivedByBob.some(
+        (message) =>
+          message.type === "participant:mediaControlApplied" || message.type === "participant:mediaChanged",
+      ),
+    ).toBe(false);
   });
 
   it("lets the creator share creator status", async () => {
@@ -812,5 +816,36 @@ describe("SocketGateway chat protocol", () => {
       type: "room:closed",
       reason: "media_server_error",
     });
+  });
+
+  it("runs disconnect cleanup only once for a duplicate close notification", async () => {
+    const { roomManager, url } = await createTestGateway();
+    await connectClient(url, joinPayload("peer_a", "Alice"));
+    const internals = gateway as unknown as {
+      clients: Map<WebSocket, unknown>;
+      handleDisconnect: (context: unknown) => Promise<void>;
+    };
+    const context = [...internals.clients.values()][0];
+
+    await internals.handleDisconnect(context);
+    await internals.handleDisconnect(context);
+
+    expect(roomManager.leave).toHaveBeenCalledTimes(1);
+  });
+
+  it("catches a rejected async socket close cleanup", async () => {
+    const roomManager = createRoomManagerMock();
+    roomManager.leave.mockRejectedValueOnce(new Error("redis cleanup failed"));
+    const { url } = await createTestGateway(roomManager);
+    vi.mocked(logger.warn).mockClear();
+    const client = await connectClient(url, joinPayload("peer_a", "Alice"));
+
+    await closeClient(client);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      "websocket disconnect cleanup failed",
+      expect.objectContaining({ participantId: "peer_a", roomId: room.roomId }),
+    );
   });
 });

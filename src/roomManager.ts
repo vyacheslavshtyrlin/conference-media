@@ -1,11 +1,10 @@
-import { CHAT_HISTORY_LIMIT, CHAT_MESSAGE_TEXT_MAX_LENGTH, MAX_ROOM_PARTICIPANTS } from "#contracts";
+import { CHAT_HISTORY_LIMIT, CHAT_MESSAGE_TEXT_MAX_LENGTH } from "#contracts";
 import type {
   ChatMessage,
   MediaKind,
   MediaSource,
   Participant,
   ParticipantConnectionQuality,
-  ParticipantMedia,
   RoomClosedReason,
   RoomMetadata,
 } from "#contracts";
@@ -28,7 +27,8 @@ type RuntimeRoomState = {
 type CreatorControlResult = {
   actor: Participant;
   target: Participant;
-  chatMessage: ChatMessage;
+  chatMessage?: ChatMessage;
+  closedProducerIds?: string[];
 };
 
 export class RoomManager {
@@ -42,6 +42,8 @@ export class RoomManager {
     private readonly mediasoup: MediasoupService,
     private readonly emptyGraceMs: number,
     private readonly logger?: Logger,
+    private readonly getMediaEpoch: () => string = () => "test-media-epoch",
+    private readonly isMediaLeaseHealthy: () => boolean = () => true,
   ) {
     mediasoup.setRoomDeadCallback((roomId, reason) => {
       this.handleRoomDead(roomId, reason);
@@ -67,17 +69,12 @@ export class RoomManager {
     joinMessage?: ChatMessage;
   }> {
     return this.runExclusive(payload.roomId, async () => {
+      this.assertMediaLeaseHealthy();
       const roomBeforeJoin = await this.repository.getRoom(payload.roomId);
       const shouldRestoreEmptyTtl = Boolean(roomBeforeJoin.expiresAt);
       const metadata = await this.repository.touchActiveRoom(roomBeforeJoin);
       const state = await this.ensureRuntimeRoom(metadata);
       state.metadata = metadata;
-
-      if (!state.peers.getPeer(payload.participantId) && state.peers.count() >= MAX_ROOM_PARTICIPANTS) {
-        throw new SignalingError("ROOM_FULL", "Room is full");
-      }
-
-      await this.repository.assertRoomCapacity(metadata.roomId, payload.participantId);
 
       const alreadyJoined = Boolean(state.peers.getPeer(payload.participantId));
       const participant = state.peers.addPeer(payload);
@@ -89,7 +86,7 @@ export class RoomManager {
       }
 
       try {
-        await this.repository.saveParticipant(metadata.roomId, participant);
+        await this.repository.saveParticipant(metadata.roomId, participant, this.getMediaEpoch());
         participantSaved = true;
         await this.mediasoup.ensureRoom(metadata.roomId);
       } catch (error) {
@@ -105,35 +102,27 @@ export class RoomManager {
         throw error;
       }
 
-      let chatMessages: ChatMessage[];
+      let chatMessages: ChatMessage[] = [];
       let joinMessage: ChatMessage | undefined;
       try {
         chatMessages = await this.repository.listChatMessages(metadata.roomId);
-        joinMessage = alreadyJoined
-          ? undefined
-          : await this.appendSystemChatMessage(metadata.roomId, `${participant.displayName} подключился к конференции`);
-        if (joinMessage) {
-          chatMessages = [...chatMessages, joinMessage].slice(-CHAT_HISTORY_LIMIT);
-        }
       } catch (error) {
-        if (!alreadyJoined) {
-          await this.rollbackFailedJoin(
-            metadata.roomId,
-            participant.participantId,
-            state,
-            participantSaved,
-            shouldRestoreEmptyTtl,
-          );
-        }
-        this.logger?.warn("chat initialization failed during room join", {
+        this.logger?.warn("chat history read failed during room join", {
           roomId: metadata.roomId,
           participantId: participant.participantId,
           error: String(error),
         });
-        throw new SignalingError(
-          "MEDIASOUP_ERROR",
-          "Room chat is temporarily unavailable. Please refresh and join again.",
+      }
+      if (!alreadyJoined) {
+        joinMessage = await this.appendSystemChatMessageBestEffort(
+          metadata.roomId,
+          `${participant.displayName} подключился к конференции`,
+          participant.participantId,
+          "join_log",
         );
+        if (joinMessage) {
+          chatMessages = [...chatMessages, joinMessage].slice(-CHAT_HISTORY_LIMIT);
+        }
       }
 
       return {
@@ -154,20 +143,6 @@ export class RoomManager {
     return this.requireRuntimeRoom(roomId).peers.getPeer(participantId);
   }
 
-  async setMedia(roomId: string, participantId: string, media: ParticipantMedia): Promise<Participant> {
-    return this.runExclusive(roomId, async () => {
-      const state = this.requireRuntimeRoom(roomId);
-
-      const participant = state.peers.setMedia(participantId, media);
-      if (!participant) {
-        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
-      }
-
-      await this.repository.saveParticipant(roomId, participant);
-      return participant;
-    });
-  }
-
   async setConnectionQuality(
     roomId: string,
     participantId: string,
@@ -181,7 +156,7 @@ export class RoomManager {
         throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
       }
 
-      await this.repository.saveParticipant(roomId, participant);
+      await this.repository.saveParticipant(roomId, participant, this.getMediaEpoch());
       return participant;
     });
   }
@@ -211,15 +186,42 @@ export class RoomManager {
     kind: MediaKind,
     rtpParameters: unknown,
     source: "mic" | "camera" | "screen",
-    onClose: (producerId: string) => void,
+    onClose: (result: { producerId: string; source: "mic" | "camera" | "screen"; participant: Participant }) => void,
   ) {
     return this.runExclusive(roomId, async () => {
       this.assertJoined(roomId, participantId);
+      const state = this.requireRuntimeRoom(roomId);
       if ((source === "mic" && kind !== "audio") || (source !== "mic" && kind !== "video")) {
         throw new SignalingError("INVALID_PAYLOAD", "Producer kind does not match media source");
       }
 
-      return this.mediasoup.produce(roomId, participantId, transportId, kind, rtpParameters, source, onClose);
+      const data = await this.mediasoup.produce(
+        roomId,
+        participantId,
+        transportId,
+        kind,
+        rtpParameters,
+        source,
+        (producerId) => {
+          void this.runExclusive(roomId, async () => {
+            const runtime = this.rooms.get(roomId);
+            if (!runtime) return;
+            const reconciled = await this.reconcileParticipantMediaLocked(runtime, participantId);
+            if (reconciled.changed) {
+              onClose({ producerId, source, participant: reconciled.participant });
+            }
+          }).catch((error: unknown) => {
+            this.logger?.warn("producer close reconciliation failed", {
+              roomId,
+              participantId,
+              producerId,
+              error: String(error),
+            });
+          });
+        },
+      );
+      const reconciled = await this.reconcileParticipantMediaLocked(state, participantId);
+      return { ...data, participant: reconciled.participant };
     });
   }
 
@@ -233,7 +235,24 @@ export class RoomManager {
   async closeProducer(roomId: string, participantId: string, producerId: string) {
     return this.runExclusive(roomId, async () => {
       this.assertJoined(roomId, participantId);
-      return this.mediasoup.closeProducer(roomId, participantId, producerId);
+      const closed = await this.mediasoup.closeProducer(roomId, participantId, producerId);
+      const reconciled = await this.reconcileParticipantMediaLocked(
+        this.requireRuntimeRoom(roomId),
+        participantId,
+      );
+      return { ...closed, participant: reconciled.participant };
+    });
+  }
+
+  async setProducerPaused(roomId: string, participantId: string, producerId: string, paused: boolean) {
+    return this.runExclusive(roomId, async () => {
+      this.assertJoined(roomId, participantId);
+      const changed = await this.mediasoup.setProducerPaused(roomId, participantId, producerId, paused);
+      const reconciled = await this.reconcileParticipantMediaLocked(
+        this.requireRuntimeRoom(roomId),
+        participantId,
+      );
+      return { ...changed, participant: reconciled.participant };
     });
   }
 
@@ -273,9 +292,11 @@ export class RoomManager {
       state.peers.removePeer(targetParticipantId);
       await this.repository.removeParticipant(roomId, targetParticipantId);
       await this.repository.setRoomSessionCreator(roomId, targetParticipantId, false);
-      const chatMessage = await this.appendSystemChatMessage(
+      const chatMessage = await this.appendSystemChatMessageBestEffort(
         roomId,
         `${actor.displayName} removed ${target.displayName} from the conference`,
+        targetParticipantId,
+        "kick_log",
       );
 
       return { actor, target, chatMessage };
@@ -294,24 +315,24 @@ export class RoomManager {
         actorParticipantId,
         targetParticipantId,
       );
-      const nextMedia: ParticipantMedia = {
-        ...target.media,
-        [source]: source === "mic" ? "muted" : "off",
-      };
-
-      await this.mediasoup.closeProducersForSource(roomId, targetParticipantId, source);
-      const nextTarget = state.peers.setMedia(targetParticipantId, nextMedia);
-      if (!nextTarget) {
-        throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+      const closedProducerIds = await this.mediasoup.closeProducersForSource(
+        roomId,
+        targetParticipantId,
+        source,
+      );
+      if (closedProducerIds.length === 0) {
+        throw new SignalingError("INVALID_PAYLOAD", "Target has no published media for this source");
       }
-      await this.repository.saveParticipant(roomId, nextTarget);
+      const nextTarget = (await this.reconcileParticipantMediaLocked(state, targetParticipantId)).participant;
 
-      const chatMessage = await this.appendSystemChatMessage(
+      const chatMessage = await this.appendSystemChatMessageBestEffort(
         roomId,
         this.getCreatorMediaControlMessage(actor.displayName, target.displayName, source),
+        targetParticipantId,
+        "creator_media_log",
       );
 
-      return { actor, target: nextTarget, chatMessage };
+      return { actor, target: nextTarget, chatMessage, closedProducerIds };
     });
   }
 
@@ -332,11 +353,13 @@ export class RoomManager {
         throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
       }
 
-      await this.repository.saveParticipant(roomId, nextTarget);
+      await this.repository.saveParticipant(roomId, nextTarget, this.getMediaEpoch());
       await this.repository.setRoomSessionCreator(roomId, targetParticipantId, true);
-      const chatMessage = await this.appendSystemChatMessage(
+      const chatMessage = await this.appendSystemChatMessageBestEffort(
         roomId,
         `${actor.displayName} shared creator status with ${target.displayName}`,
+        targetParticipantId,
+        "creator_grant_log",
       );
 
       return { actor, target: nextTarget, chatMessage };
@@ -356,16 +379,7 @@ export class RoomManager {
       }
 
       this.mediasoup.closePeer(roomId, participantId);
-      const next = state.peers.setMedia(participantId, {
-        mic: "off",
-        camera: "off",
-        screen: "off",
-      });
-      if (next) {
-        await this.repository.saveParticipant(roomId, next);
-      }
-
-      return next;
+      return (await this.reconcileParticipantMediaLocked(state, participantId)).participant;
     });
   }
 
@@ -405,12 +419,19 @@ export class RoomManager {
         return {};
       }
 
-      this.mediasoup.closePeer(roomId, participantId);
       const participant = state.peers.removePeer(participantId);
+      if (!participant) {
+        return {};
+      }
+
+      this.mediasoup.closePeer(roomId, participantId);
       await this.repository.removeParticipant(roomId, participantId);
-      const chatMessage = participant
-        ? await this.appendSystemChatMessage(roomId, `${participant.displayName} покинул конференцию`)
-        : undefined;
+      const chatMessage = await this.appendSystemChatMessageBestEffort(
+        roomId,
+        `${participant.displayName} покинул конференцию`,
+        participantId,
+        "leave_log",
+      );
 
       if (state.peers.count() === 0) {
         state.metadata = await this.repository.markRoomEmpty(state.metadata);
@@ -436,9 +457,12 @@ export class RoomManager {
       }
 
       this.rooms.delete(roomId);
-      await this.repository.closeRoom(state.metadata, reason);
-      this.onRoomClosedCallback?.(roomId, reason);
-      this.roomLocks.delete(roomId);
+      try {
+        await this.repository.closeRoom(state.metadata, reason);
+      } finally {
+        this.onRoomClosedCallback?.(roomId, reason);
+        this.roomLocks.delete(roomId);
+      }
     }).catch((error: unknown) => {
       this.logger?.error("handleRoomDead cleanup failed", { roomId, error: String(error) });
     });
@@ -465,6 +489,32 @@ export class RoomManager {
     }
 
     return state;
+  }
+
+  private async reconcileParticipantMediaLocked(
+    state: RuntimeRoomState,
+    participantId: string,
+  ): Promise<{ participant: Participant; changed: boolean }> {
+    const current = state.peers.getPeer(participantId);
+    if (!current) {
+      throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+    }
+
+    const media = this.mediasoup.getParticipantMedia(state.metadata.roomId, participantId);
+    const changed =
+      current.media.mic !== media.mic ||
+      current.media.camera !== media.camera ||
+      current.media.screen !== media.screen;
+    if (!changed) {
+      return { participant: current, changed: false };
+    }
+
+    const participant = state.peers.setMedia(participantId, media);
+    if (!participant) {
+      throw new SignalingError("INVALID_TOKEN", "Participant is not joined");
+    }
+    await this.repository.saveParticipant(state.metadata.roomId, participant, this.getMediaEpoch());
+    return { participant, changed: true };
   }
 
   private assertJoined(roomId: string, participantId: string): void {
@@ -522,6 +572,25 @@ export class RoomManager {
       text,
       createdAt: new Date().toISOString(),
     });
+  }
+
+  private async appendSystemChatMessageBestEffort(
+    roomId: string,
+    text: string,
+    participantId: string,
+    operation: string,
+  ): Promise<ChatMessage | undefined> {
+    try {
+      return await this.appendSystemChatMessage(roomId, text);
+    } catch (error) {
+      this.logger?.warn("system chat append failed", {
+        roomId,
+        participantId,
+        operation,
+        error: String(error),
+      });
+      return undefined;
+    }
   }
 
   private createMessageId(): string {
@@ -585,8 +654,49 @@ export class RoomManager {
     });
   }
 
+  async shutdown(): Promise<void> {
+    for (const roomId of [...this.rooms.keys()]) {
+      await this.runExclusive(roomId, async () => {
+        const state = this.rooms.get(roomId);
+        if (!state) {
+          return;
+        }
+
+        if (state.cleanupTimer) {
+          clearTimeout(state.cleanupTimer);
+        }
+        for (const participant of state.peers.list()) {
+          this.mediasoup.closePeer(roomId, participant.participantId);
+          try {
+            await this.repository.removeParticipant(roomId, participant.participantId);
+          } catch (error) {
+            this.logger?.warn("shutdown participant cleanup failed", {
+              roomId,
+              participantId: participant.participantId,
+              error: String(error),
+            });
+          }
+        }
+        try {
+          state.metadata = await this.repository.markRoomEmpty(state.metadata);
+        } catch (error) {
+          this.logger?.warn("shutdown empty-room transition failed", { roomId, error: String(error) });
+        }
+        this.mediasoup.closeRoom(roomId);
+        this.rooms.delete(roomId);
+        this.roomLocks.delete(roomId);
+      });
+    }
+  }
+
   private runExclusive<T>(roomId: string, operation: () => Promise<T>): Promise<T> {
     return this.getRoomLock(roomId).runExclusive(operation);
+  }
+
+  private assertMediaLeaseHealthy(): void {
+    if (!this.isMediaLeaseHealthy()) {
+      throw new SignalingError("MEDIASOUP_ERROR", "Media process lease is unavailable");
+    }
   }
 
   private getRoomLock(roomId: string): Mutex {

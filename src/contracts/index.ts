@@ -1,6 +1,5 @@
 import { z } from "zod";
 
-export const MAX_ROOM_PARTICIPANTS = 10;
 export const EMPTY_ROOM_TTL_SECONDS = 15 * 60;
 export const CHAT_HISTORY_LIMIT = 500;
 export const CHAT_MESSAGE_TEXT_MAX_LENGTH = 4000;
@@ -145,7 +144,6 @@ export const errorCodeSchema = z.enum([
   "ROOM_NOT_FOUND",
   "ROOM_EXPIRED",
   "ROOM_CLOSED",
-  "ROOM_FULL",
   "INVALID_TOKEN",
   "INVALID_PAYLOAD",
   "TRANSPORT_NOT_FOUND",
@@ -229,10 +227,11 @@ export const closeProducerRequestEventSchema = z.object({
   producerId: z.string().min(1),
 });
 
-export const setMediaStateRequestEventSchema = z.object({
-  type: z.literal("media:setState"),
+export const setProducerPausedRequestEventSchema = z.object({
+  type: z.literal("mediasoup:setProducerPaused"),
   requestId: requestIdSchema,
-  media: participantMediaSchema,
+  producerId: z.string().min(1),
+  paused: z.boolean(),
 });
 
 export const setConnectionQualityRequestEventSchema = z.object({
@@ -284,7 +283,7 @@ export const clientWebSocketEventSchema = z.discriminatedUnion("type", [
   produceRequestEventSchema,
   consumeRequestEventSchema,
   closeProducerRequestEventSchema,
-  setMediaStateRequestEventSchema,
+  setProducerPausedRequestEventSchema,
   setConnectionQualityRequestEventSchema,
   kickParticipantRequestEventSchema,
   disableParticipantMediaRequestEventSchema,
@@ -307,7 +306,7 @@ export type ConnectTransportRequestEvent = z.infer<typeof connectTransportReques
 export type ProduceRequestEvent = z.infer<typeof produceRequestEventSchema>;
 export type ConsumeRequestEvent = z.infer<typeof consumeRequestEventSchema>;
 export type CloseProducerRequestEvent = z.infer<typeof closeProducerRequestEventSchema>;
-export type SetMediaStateRequestEvent = z.infer<typeof setMediaStateRequestEventSchema>;
+export type SetProducerPausedRequestEvent = z.infer<typeof setProducerPausedRequestEventSchema>;
 export type SetConnectionQualityRequestEvent = z.infer<typeof setConnectionQualityRequestEventSchema>;
 export type KickParticipantRequestEvent = z.infer<typeof kickParticipantRequestEventSchema>;
 export type DisableParticipantMediaRequestEvent = z.infer<typeof disableParticipantMediaRequestEventSchema>;

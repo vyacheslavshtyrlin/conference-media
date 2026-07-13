@@ -1,7 +1,6 @@
 import {
   CHAT_HISTORY_LIMIT,
   EMPTY_ROOM_TTL_SECONDS,
-  MAX_ROOM_PARTICIPANTS,
   chatMessageSchema,
   participantSchema,
   roomMetadataSchema,
@@ -51,19 +50,6 @@ export class RedisRoomRepository {
     return parsed.data;
   }
 
-  async assertRoomCapacity(roomId: string, participantId: string): Promise<void> {
-    const participantsKey = this.participantsKey(roomId);
-    const exists = await this.redis.hExists(participantsKey, participantId);
-    if (exists) {
-      return;
-    }
-
-    const count = await this.redis.hLen(participantsKey);
-    if (count >= MAX_ROOM_PARTICIPANTS) {
-      throw new SignalingError("ROOM_FULL", "Room is full");
-    }
-  }
-
   async touchActiveRoom(room: RoomMetadata): Promise<RoomMetadata> {
     const activeRoom = roomMetadataSchema.parse({
       ...room,
@@ -82,10 +68,14 @@ export class RedisRoomRepository {
     return activeRoom;
   }
 
-  async saveParticipant(roomId: string, participant: Participant): Promise<void> {
+  async saveParticipant(roomId: string, participant: Participant, mediaEpoch: string): Promise<void> {
     const key = this.participantsKey(roomId);
 
-    await this.redis.hSet(key, participant.participantId, JSON.stringify(participantSchema.parse(participant)));
+    await this.redis.hSet(
+      key,
+      participant.participantId,
+      JSON.stringify({ participant: participantSchema.parse(participant), mediaEpoch }),
+    );
   }
 
   async setRoomSessionCreator(roomId: string, participantId: string, isCreator: boolean): Promise<void> {
