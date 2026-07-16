@@ -17,6 +17,7 @@ import type {
 import type { SignalingConfig } from "./config.js";
 import { SignalingError } from "./errors.js";
 import type { Logger } from "./logger.js";
+import { getMediaMetrics, type MediaMetrics } from "./metrics.js";
 
 type TransportRecord = {
   transport: WebRtcTransport;
@@ -77,6 +78,7 @@ export class MediasoupService {
   constructor(
     private readonly config: SignalingConfig["mediasoup"],
     private readonly logger?: Logger,
+    private readonly metrics: MediaMetrics = getMediaMetrics(),
   ) {}
 
   setRoomDeadCallback(callback: (roomId: string, reason: RoomClosedReason) => void): void {
@@ -92,7 +94,10 @@ export class MediasoupService {
     this.closing = false;
     this.workers = Array.from({ length: count });
     await Promise.all(Array.from({ length: count }, (_, index) => this.createWorkerAt(index)));
-    this.logger?.info("mediasoup worker pool ready", { count: this.getUsableWorkerCount() });
+    this.logger?.info("mediasoup worker pool ready", {
+      operation: "mediasoup.workerPool.init",
+      count: this.getUsableWorkerCount(),
+    });
   }
 
   closeAll(): void {
@@ -151,6 +156,12 @@ export class MediasoupService {
     });
 
     this.rooms.set(roomId, room);
+    this.logger?.info("mediasoup room created", {
+      operation: "mediasoup.room.create",
+      roomId,
+      workerIndex,
+      outcome: "ok",
+    });
     return room;
   }
 
@@ -189,6 +200,22 @@ export class MediasoupService {
     room.transports.set(transport.id, { transport, participantId, direction });
     transport.observer.once("close", () => {
       room.transports.delete(transport.id);
+      this.logger?.info("mediasoup transport closed", {
+        operation: "mediasoup.transport.close",
+        roomId,
+        participantId,
+        transportId: transport.id,
+        direction,
+        outcome: "ok",
+      });
+    });
+    this.logger?.info("mediasoup transport created", {
+      operation: "mediasoup.transport.create",
+      roomId,
+      participantId,
+      transportId: transport.id,
+      direction,
+      outcome: "ok",
     });
 
     return {
@@ -269,6 +296,15 @@ export class MediasoupService {
       }
       this.closeConsumersForProducer(room, producer.id);
       onClose(producer.id);
+      this.logger?.info("mediasoup producer closed", {
+        operation: "mediasoup.producer.close",
+        roomId,
+        participantId,
+        producerId: producer.id,
+        source,
+        kind,
+        outcome: "ok",
+      });
     });
 
     if (source === "mic") {
@@ -280,6 +316,15 @@ export class MediasoupService {
       }
     }
 
+    this.logger?.info("mediasoup producer created", {
+      operation: "mediasoup.producer.create",
+      roomId,
+      participantId,
+      producerId: producer.id,
+      source,
+      kind,
+      outcome: "ok",
+    });
     return { id: producer.id };
   }
 
@@ -341,6 +386,22 @@ export class MediasoupService {
     room.consumers.set(consumer.id, { consumer, participantId, producerId });
     consumer.observer.once("close", () => {
       room.consumers.delete(consumer.id);
+      this.logger?.info("mediasoup consumer closed", {
+        operation: "mediasoup.consumer.close",
+        roomId,
+        participantId,
+        consumerId: consumer.id,
+        producerId,
+        outcome: "ok",
+      });
+    });
+    this.logger?.info("mediasoup consumer created", {
+      operation: "mediasoup.consumer.create",
+      roomId,
+      participantId,
+      consumerId: consumer.id,
+      producerId,
+      outcome: "ok",
     });
 
     return {
@@ -366,6 +427,14 @@ export class MediasoupService {
 
     const { source } = record;
     record.producer.close();
+    this.logger?.info("mediasoup producer close requested", {
+      operation: "mediasoup.producer.closeRequested",
+      roomId,
+      participantId,
+      producerId,
+      source,
+      outcome: "ok",
+    });
     return { producerId, source };
   }
 
@@ -404,6 +473,17 @@ export class MediasoupService {
 
       closedProducerIds.push(producerId);
       record.producer.close();
+    }
+
+    if (closedProducerIds.length > 0) {
+      this.logger?.info("mediasoup source producers closed", {
+        operation: "mediasoup.producer.closeSource",
+        roomId,
+        participantId,
+        source,
+        closedProducerCount: closedProducerIds.length,
+        outcome: "ok",
+      });
     }
 
     return closedProducerIds;
@@ -477,6 +557,14 @@ export class MediasoupService {
       }
     }
 
+    this.logger?.info("mediasoup peer media closed", {
+      operation: "mediasoup.peer.close",
+      roomId,
+      participantId,
+      closedProducerCount: closedProducerIds.length,
+      outcome: "ok",
+    });
+
     return closedProducerIds;
   }
 
@@ -488,6 +576,11 @@ export class MediasoupService {
 
     room.router.close();
     this.rooms.delete(roomId);
+    this.logger?.info("mediasoup room closed", {
+      operation: "mediasoup.room.close",
+      roomId,
+      outcome: "ok",
+    });
   }
 
   getRuntimeStats(): {
@@ -610,6 +703,13 @@ export class MediasoupService {
     room.producers.clear();
     room.consumers.clear();
     this.rooms.delete(roomId);
+    this.logger?.error("mediasoup runtime room closed after failure", {
+      operation: "mediasoup.room.dead",
+      errorCode: reason === "media_server_error" ? "MEDIA_SERVER_ERROR" : "ROOM_CLOSED_BY_SERVER",
+      roomId,
+      reason,
+      outcome: "ok",
+    });
     this.onRoomDeadCallback?.(roomId, reason);
   }
 
@@ -626,6 +726,8 @@ export class MediasoupService {
     } catch (error) {
       this.workers[index] = undefined;
       this.logger?.error("mediasoup worker replacement failed", {
+        operation: "mediasoup.worker.replace",
+        errorCode: "MEDIASOUP_WORKER_REPLACEMENT_FAILED",
         workerIndex: index,
         error: String(error),
       });
@@ -638,7 +740,11 @@ export class MediasoupService {
       return;
     }
 
-    this.logger?.error("mediasoup worker died", { workerIndex: index });
+    this.logger?.error("mediasoup worker died", {
+      operation: "mediasoup.worker.died",
+      errorCode: "MEDIASOUP_WORKER_DIED",
+      workerIndex: index,
+    });
     this.workers[index] = undefined;
     for (const [roomId, room] of [...this.rooms.entries()]) {
       if (room.workerIndex === index) {
@@ -648,6 +754,7 @@ export class MediasoupService {
     try {
       await this.createWorkerAt(index);
       this.logger?.info("mediasoup worker replaced", {
+        operation: "mediasoup.worker.replace",
         workerIndex: index,
         usableWorkers: this.getUsableWorkerCount(),
       });

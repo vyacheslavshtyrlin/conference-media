@@ -11,6 +11,7 @@ import { WebSocket, WebSocketServer } from "ws";
 
 import { SignalingError, toContractError } from "./errors.js";
 import type { Logger } from "./logger.js";
+import { getMediaMetrics, type MediaMetrics } from "./metrics.js";
 import type { RoomManager } from "./roomManager.js";
 import { verifyJoinToken } from "./token.js";
 
@@ -28,6 +29,7 @@ type ClientContext = {
   participantId: string;
   joined: boolean;
   isAlive: boolean;
+  disconnectMetricRecorded: boolean;
   rateLimit: {
     windowStartedAt: number;
     messageCount: number;
@@ -46,6 +48,7 @@ export class SocketGateway {
     private readonly joinTokenSecret: string,
     private readonly logger: Logger,
     private readonly config: WebSocketRuntimeConfig,
+    private readonly metrics: MediaMetrics = getMediaMetrics(),
   ) {}
 
   start(): void {
@@ -79,6 +82,7 @@ export class SocketGateway {
       this.removeRoomSocket(context.roomId, context.socket);
       this.removeParticipantSocket(context);
       context.socket.close(1001, "Server shutting down");
+      this.recordDisconnectOnce(context, "server_close");
     }
     this.clients.clear();
     this.roomSockets.clear();
@@ -89,6 +93,7 @@ export class SocketGateway {
     for (const context of this.clients.values()) {
       context.joined = false;
       context.socket.terminate();
+      this.recordDisconnectOnce(context, "server_close");
     }
     this.clients.clear();
     this.roomSockets.clear();
@@ -96,6 +101,7 @@ export class SocketGateway {
   }
 
   private async handleConnection(socket: WebSocket, request: IncomingMessage): Promise<void> {
+    const startedAt = Date.now();
     try {
       this.assertAllowedOrigin(request);
       const url = new URL(request.url ?? "", "ws://localhost");
@@ -106,6 +112,7 @@ export class SocketGateway {
         participantId: payload.participantId,
         joined: false,
         isAlive: true,
+        disconnectMetricRecorded: false,
         rateLimit: {
           windowStartedAt: Date.now(),
           messageCount: 0,
@@ -122,6 +129,8 @@ export class SocketGateway {
       socket.on("close", () => {
         void this.handleDisconnect(context).catch((error: unknown) => {
           this.logger.warn("websocket disconnect cleanup failed", {
+            operation: "websocket.disconnect",
+            errorCode: "DISCONNECT_CLEANUP_FAILED",
             roomId: context.roomId,
             participantId: context.participantId,
             error: String(error),
@@ -129,17 +138,47 @@ export class SocketGateway {
         });
       });
       socket.on("error", (error) => {
-        this.logger.warn("websocket error", { error: error.message, participantId: context.participantId });
+        this.logger.warn("websocket error", {
+          operation: "websocket.connection",
+          errorCode: "WEBSOCKET_ERROR",
+          error: error.message,
+          roomId: context.roomId,
+          participantId: context.participantId,
+        });
       });
 
       await this.joinRoom(context, payload);
+      this.logger.info("websocket connection accepted", {
+        operation: "websocket.connect",
+        durationMs: Date.now() - startedAt,
+        roomId: context.roomId,
+        participantId: context.participantId,
+        outcome: "ok",
+      });
+      this.metrics.recordWebSocketConnect({
+        outcome: "ok",
+        errorCode: null,
+        durationMs: Date.now() - startedAt,
+      });
     } catch (error) {
-      this.logger.error("connection rejected", { error: error instanceof Error ? error.message : String(error) });
+      const contractError = toContractError(error);
+      const expectedClientError = error instanceof SignalingError;
+      this.logger[expectedClientError ? "warn" : "error"]("websocket connection rejected", {
+        operation: "websocket.connect",
+        durationMs: Date.now() - startedAt,
+        errorCode: contractError.code,
+        outcome: expectedClientError ? "client_error" : "failure",
+      });
       this.send(socket, {
         type: "response",
         requestId: "connection",
         ok: false,
-        error: toContractError(error),
+        error: contractError,
+      });
+      this.metrics.recordWebSocketConnect({
+        outcome: expectedClientError ? "client_error" : "failure",
+        errorCode: contractError.code,
+        durationMs: Date.now() - startedAt,
       });
       socket.close(1008);
     }
@@ -152,7 +191,11 @@ export class SocketGateway {
 
     const origin = request.headers.origin;
     if (!origin || !this.config.allowedOrigins.includes(origin)) {
-      this.logger.warn("websocket origin rejected", { origin: origin ?? "missing" });
+      this.logger.warn("websocket origin rejected", {
+        operation: "websocket.connect",
+        errorCode: "ORIGIN_NOT_ALLOWED",
+        origin: origin ?? "missing",
+      });
       throw new SignalingError("INVALID_TOKEN", "WebSocket origin is not allowed");
     }
   }
@@ -161,10 +204,20 @@ export class SocketGateway {
     if (this.isRateLimited(context)) {
       const requestId = this.extractRequestId(raw);
       this.logger.warn("websocket message rate limit exceeded", {
+        operation: "websocket.command",
+        commandId: requestId,
         participantId: context.participantId,
         roomId: context.roomId,
         limit: this.config.rateLimitMaxMessages,
         windowMs: this.config.rateLimitWindowMs,
+        errorCode: "INVALID_PAYLOAD",
+        outcome: "client_error",
+      });
+      this.metrics.recordWebSocketCommand({
+        operation: "websocket.command",
+        outcome: "client_error",
+        errorCode: "INVALID_PAYLOAD",
+        durationMs: 0,
       });
       this.sendError(context.socket, requestId, "INVALID_PAYLOAD", "Message rate limit exceeded");
       context.socket.close(1008, "Message rate limit exceeded");
@@ -172,9 +225,25 @@ export class SocketGateway {
     }
 
     let parsed: unknown;
+    const startedAt = Date.now();
     try {
       parsed = JSON.parse(raw.toString());
     } catch {
+      this.logger.warn("websocket command rejected", {
+        operation: "websocket.command",
+        commandId: "unknown",
+        durationMs: Date.now() - startedAt,
+        roomId: context.roomId,
+        participantId: context.participantId,
+        errorCode: "INVALID_PAYLOAD",
+        outcome: "client_error",
+      });
+      this.metrics.recordWebSocketCommand({
+        operation: "websocket.command",
+        outcome: "client_error",
+        errorCode: "INVALID_PAYLOAD",
+        durationMs: Date.now() - startedAt,
+      });
       this.sendError(context.socket, "unknown", "INVALID_PAYLOAD", "Payload must be valid JSON");
       return;
     }
@@ -185,18 +254,64 @@ export class SocketGateway {
         typeof parsed === "object" && parsed !== null && "requestId" in parsed && typeof parsed.requestId === "string"
           ? parsed.requestId
           : "unknown";
+      this.logger.warn("websocket command rejected", {
+        operation: "websocket.command",
+        commandId: requestId,
+        durationMs: Date.now() - startedAt,
+        roomId: context.roomId,
+        participantId: context.participantId,
+        errorCode: "INVALID_PAYLOAD",
+        outcome: "client_error",
+      });
+      this.metrics.recordWebSocketCommand({
+        operation: "websocket.command",
+        outcome: "client_error",
+        errorCode: "INVALID_PAYLOAD",
+        durationMs: Date.now() - startedAt,
+      });
       this.sendError(context.socket, requestId, "INVALID_PAYLOAD", "Payload does not match WebSocket contract");
       return;
     }
 
     try {
       await this.routeEvent(context, result.data);
+      this.logger.info("websocket command completed", {
+        operation: result.data.type,
+        commandId: result.data.requestId,
+        durationMs: Date.now() - startedAt,
+        roomId: context.roomId,
+        participantId: context.participantId,
+        outcome: "ok",
+      });
+      this.metrics.recordWebSocketCommand({
+        operation: result.data.type,
+        outcome: "ok",
+        errorCode: null,
+        durationMs: Date.now() - startedAt,
+      });
     } catch (error) {
+      const contractError = toContractError(error);
+      const expectedClientError = error instanceof SignalingError;
+      this.logger[expectedClientError ? "warn" : "error"]("websocket command failed", {
+        operation: result.data.type,
+        commandId: result.data.requestId,
+        durationMs: Date.now() - startedAt,
+        roomId: context.roomId,
+        participantId: context.participantId,
+        errorCode: contractError.code,
+        outcome: expectedClientError ? "client_error" : "failure",
+      });
       this.send(context.socket, {
         type: "response",
         requestId: result.data.requestId,
         ok: false,
-        error: toContractError(error),
+        error: contractError,
+      });
+      this.metrics.recordWebSocketCommand({
+        operation: result.data.type,
+        outcome: expectedClientError ? "client_error" : "failure",
+        errorCode: contractError.code,
+        durationMs: Date.now() - startedAt,
       });
     }
   }
@@ -524,10 +639,14 @@ export class SocketGateway {
   }
 
   private async handleDisconnect(context: ClientContext): Promise<void> {
-    this.clients.delete(context.socket);
+    const wasTracked = this.clients.delete(context.socket);
+    if (!wasTracked) {
+      return;
+    }
     this.removeRoomSocket(context.roomId, context.socket);
     this.removeParticipantSocket(context);
     await this.leave(context);
+    this.recordDisconnectOnce(context, "client_close");
   }
 
   private broadcast(roomId: string, event: ServerWebSocketEvent, except?: WebSocket): void {
@@ -566,6 +685,16 @@ export class SocketGateway {
         context.participantId,
       );
       previousSocket.close(1000, "Session superseded");
+      if (previousContext) {
+        this.recordDisconnectOnce(previousContext, "server_close");
+      }
+      this.metrics.recordWebSocketReconnect({ outcome: "ok", reason: "session_superseded" });
+      this.logger.info("websocket session superseded by reconnect", {
+        operation: "websocket.reconnect",
+        roomId: context.roomId,
+        participantId: context.participantId,
+        outcome: "ok",
+      });
       this.participantSockets.set(key, context.socket);
       return releasedParticipant;
     }
@@ -611,6 +740,11 @@ export class SocketGateway {
       }
       sockets.delete(socket);
       socket.close(1000, reason);
+      if (context) {
+        this.recordDisconnectOnce(context, "server_close");
+      } else {
+        this.metrics.recordWebSocketDisconnect({ reason: "server_close" });
+      }
     }
 
     this.roomSockets.delete(roomId);
@@ -631,6 +765,11 @@ export class SocketGateway {
     }
 
     socket.close(1000, reason);
+    if (context) {
+      this.recordDisconnectOnce(context, "server_close");
+    } else {
+      this.metrics.recordWebSocketDisconnect({ reason: "server_close" });
+    }
   }
 
   private send(socket: WebSocket, event: ServerWebSocketEvent): void {
@@ -641,11 +780,18 @@ export class SocketGateway {
     if (socket.bufferedAmount > this.config.sendBackpressureBytes) {
       const context = this.clients.get(socket);
       this.logger.warn("websocket send buffer exceeded", {
+        operation: "websocket.send",
+        errorCode: "WEBSOCKET_BACKPRESSURE",
         bufferedAmount: socket.bufferedAmount,
         participantId: context?.participantId,
         roomId: context?.roomId,
       });
       socket.close(1013, "Backpressure limit exceeded");
+      if (context) {
+        this.recordDisconnectOnce(context, "backpressure");
+      } else {
+        this.metrics.recordWebSocketDisconnect({ reason: "backpressure" });
+      }
       return;
     }
 
@@ -653,6 +799,8 @@ export class SocketGateway {
       if (error) {
         const context = this.clients.get(socket);
         this.logger.warn("websocket send failed", {
+          operation: "websocket.send",
+          errorCode: "WEBSOCKET_SEND_FAILED",
           error: error.message,
           participantId: context?.participantId,
           roomId: context?.roomId,
@@ -713,15 +861,34 @@ export class SocketGateway {
 
       if (!context.isAlive) {
         this.logger.warn("websocket heartbeat timeout", {
+          operation: "websocket.heartbeat",
+          errorCode: "WEBSOCKET_HEARTBEAT_TIMEOUT",
           participantId: context.participantId,
           roomId: context.roomId,
         });
         context.socket.terminate();
+        this.recordDisconnectOnce(context, "heartbeat_timeout");
         continue;
       }
 
       context.isAlive = false;
       context.socket.ping();
     }
+  }
+
+  getRuntimeStats(): { activeSockets: number } {
+    return { activeSockets: this.clients.size };
+  }
+
+  private recordDisconnectOnce(
+    context: ClientContext,
+    reason: "client_close" | "server_close" | "heartbeat_timeout" | "backpressure",
+  ): void {
+    if (context.disconnectMetricRecorded) {
+      return;
+    }
+
+    context.disconnectMetricRecorded = true;
+    this.metrics.recordWebSocketDisconnect({ reason });
   }
 }

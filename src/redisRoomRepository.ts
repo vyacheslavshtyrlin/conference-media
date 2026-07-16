@@ -8,6 +8,7 @@ import {
 import type { ChatMessage, Participant, RoomClosedReason, RoomMetadata } from "#contracts";
 
 import { SignalingError } from "./errors.js";
+import { getMediaMetrics, type MediaMetrics } from "./metrics.js";
 
 export type RedisClient = {
   get(key: string): Promise<string | null>;
@@ -26,10 +27,13 @@ export type RedisClient = {
 };
 
 export class RedisRoomRepository {
-  constructor(private readonly redis: RedisClient) {}
+  constructor(
+    private readonly redis: RedisClient,
+    private readonly metrics: MediaMetrics = getMediaMetrics(),
+  ) {}
 
   async getRoom(roomId: string): Promise<RoomMetadata> {
-    const raw = await this.redis.get(`room:${roomId}`);
+    const raw = await this.recordRedis("get_room_metadata", () => this.redis.get(`room:${roomId}`));
     if (!raw) {
       throw new SignalingError("ROOM_NOT_FOUND", "Room not found");
     }
@@ -58,12 +62,12 @@ export class RedisRoomRepository {
       closedReason: null,
     });
 
-    await this.redis.set(this.roomKey(activeRoom.roomId), JSON.stringify(activeRoom));
-    await this.redis.set(this.slugKey(activeRoom.slug), activeRoom.roomId);
-    await this.redis.persist(this.roomKey(activeRoom.roomId));
-    await this.redis.persist(this.slugKey(activeRoom.slug));
-    await this.redis.persist(this.chatKey(activeRoom.roomId));
-    await this.redis.persist(this.roomSessionsKey(activeRoom.roomId));
+    await this.recordRedis("set_room_metadata", () => this.redis.set(this.roomKey(activeRoom.roomId), JSON.stringify(activeRoom)));
+    await this.recordRedis("set_room_slug", () => this.redis.set(this.slugKey(activeRoom.slug), activeRoom.roomId));
+    await this.recordRedis("persist_room_metadata", () => this.redis.persist(this.roomKey(activeRoom.roomId)));
+    await this.recordRedis("persist_room_slug", () => this.redis.persist(this.slugKey(activeRoom.slug)));
+    await this.recordRedis("persist_room_chat", () => this.redis.persist(this.chatKey(activeRoom.roomId)));
+    await this.recordRedis("persist_room_sessions", () => this.redis.persist(this.roomSessionsKey(activeRoom.roomId)));
 
     return activeRoom;
   }
@@ -71,16 +75,16 @@ export class RedisRoomRepository {
   async saveParticipant(roomId: string, participant: Participant, mediaEpoch: string): Promise<void> {
     const key = this.participantsKey(roomId);
 
-    await this.redis.hSet(
+    await this.recordRedis("save_participant", () => this.redis.hSet(
       key,
       participant.participantId,
       JSON.stringify({ participant: participantSchema.parse(participant), mediaEpoch }),
-    );
+    ));
   }
 
   async setRoomSessionCreator(roomId: string, participantId: string, isCreator: boolean): Promise<void> {
     const key = this.roomSessionsKey(roomId);
-    const raw = await this.redis.hGet(key, participantId);
+    const raw = await this.recordRedis("get_room_session", () => this.redis.hGet(key, participantId));
     if (!raw) {
       return;
     }
@@ -96,25 +100,25 @@ export class RedisRoomRepository {
       return;
     }
 
-    await this.redis.hSet(key, participantId, JSON.stringify({ ...parsed, isCreator }));
+    await this.recordRedis("save_room_session", () => this.redis.hSet(key, participantId, JSON.stringify({ ...parsed, isCreator })));
   }
 
   async removeParticipant(roomId: string, participantId: string): Promise<void> {
-    await this.redis.hDel(this.participantsKey(roomId), participantId);
+    await this.recordRedis("remove_participant", () => this.redis.hDel(this.participantsKey(roomId), participantId));
   }
 
   async appendChatMessage(roomId: string, message: ChatMessage): Promise<ChatMessage> {
     const parsed = chatMessageSchema.parse(message);
     const key = this.chatKey(roomId);
 
-    await this.redis.rPush(key, JSON.stringify(parsed));
-    await this.redis.lTrim(key, -CHAT_HISTORY_LIMIT, -1);
+    await this.recordRedis("append_chat_message", () => this.redis.rPush(key, JSON.stringify(parsed)));
+    await this.recordRedis("trim_chat_history", () => this.redis.lTrim(key, -CHAT_HISTORY_LIMIT, -1));
 
     return parsed;
   }
 
   async listChatMessages(roomId: string): Promise<ChatMessage[]> {
-    const rawMessages = await this.redis.lRange(this.chatKey(roomId), 0, -1);
+    const rawMessages = await this.recordRedis("list_chat_history", () => this.redis.lRange(this.chatKey(roomId), 0, -1));
     const messages: ChatMessage[] = [];
 
     for (const raw of rawMessages) {
@@ -140,13 +144,13 @@ export class RedisRoomRepository {
       closedReason: null,
     });
 
-    await this.redis.set(this.roomKey(emptyRoom.roomId), JSON.stringify(emptyRoom));
-    await this.redis.set(this.slugKey(emptyRoom.slug), emptyRoom.roomId);
-    await this.redis.expire(this.roomKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.expire(this.slugKey(emptyRoom.slug), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.expire(this.chatKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.expire(this.roomSessionsKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.del(this.participantsKey(emptyRoom.roomId));
+    await this.recordRedis("set_room_metadata", () => this.redis.set(this.roomKey(emptyRoom.roomId), JSON.stringify(emptyRoom)));
+    await this.recordRedis("set_room_slug", () => this.redis.set(this.slugKey(emptyRoom.slug), emptyRoom.roomId));
+    await this.recordRedis("expire_room_metadata", () => this.redis.expire(this.roomKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("expire_room_slug", () => this.redis.expire(this.slugKey(emptyRoom.slug), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("expire_room_chat", () => this.redis.expire(this.chatKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("expire_room_sessions", () => this.redis.expire(this.roomSessionsKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("delete_room_participants", () => this.redis.del(this.participantsKey(emptyRoom.roomId)));
 
     return emptyRoom;
   }
@@ -160,19 +164,39 @@ export class RedisRoomRepository {
       closedReason: reason,
     });
 
-    await this.redis.set(this.roomKey(closedRoom.roomId), JSON.stringify(closedRoom));
-    await this.redis.set(this.slugKey(closedRoom.slug), closedRoom.roomId);
-    await this.redis.expire(this.roomKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.expire(this.slugKey(closedRoom.slug), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.expire(this.chatKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.expire(this.roomSessionsKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS);
-    await this.redis.del(this.participantsKey(closedRoom.roomId));
+    await this.recordRedis("set_room_metadata", () => this.redis.set(this.roomKey(closedRoom.roomId), JSON.stringify(closedRoom)));
+    await this.recordRedis("set_room_slug", () => this.redis.set(this.slugKey(closedRoom.slug), closedRoom.roomId));
+    await this.recordRedis("expire_room_metadata", () => this.redis.expire(this.roomKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("expire_room_slug", () => this.redis.expire(this.slugKey(closedRoom.slug), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("expire_room_chat", () => this.redis.expire(this.chatKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("expire_room_sessions", () => this.redis.expire(this.roomSessionsKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.recordRedis("delete_room_participants", () => this.redis.del(this.participantsKey(closedRoom.roomId)));
 
     return closedRoom;
   }
 
   private roomKey(roomId: string): string {
     return `room:${roomId}`;
+  }
+
+  private async recordRedis<T>(operation: string, command: () => Promise<T>): Promise<T> {
+    const startedAt = Date.now();
+    try {
+      const result = await command();
+      this.metrics.recordRedisOperation({
+        operation,
+        outcome: "ok",
+        durationMs: Date.now() - startedAt,
+      });
+      return result;
+    } catch (error) {
+      this.metrics.recordRedisOperation({
+        operation,
+        outcome: "failure",
+        durationMs: Date.now() - startedAt,
+      });
+      throw error;
+    }
   }
 
   private slugKey(slug: string): string {

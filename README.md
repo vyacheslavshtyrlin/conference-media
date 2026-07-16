@@ -27,6 +27,7 @@ Edge-маршрутизация (на app-сервере): `wss://domain/ws` →
 | --- | --- | --- |
 | `GET` | `/health` | Liveness: `{status, service: "signaling"}`. |
 | `GET` | `/ready` | Readiness: проверяет Redis + mediasoup (`200`/`503` + `checks`). |
+| `GET` | `/metrics` | Prometheus text metrics для ops: агрегированные счетчики/гистограммы/gauges без roomId, participantId, requestId, commandId или token labels. |
 | `WS` | `/ws` | Signaling-протокол: join, mediasoup transport/produce/consume, media state, chat, leave, close. |
 
 WebSocket: heartbeat, max payload, backpressure, rate limit, проверка origin (`WS_ALLOWED_ORIGINS`). Авторизация — join-токен в query `?token=` (HMAC-SHA256, общий секрет с API).
@@ -67,7 +68,7 @@ WebSocket: heartbeat, max payload, backpressure, rate limit, проверка or
 ### Корень
 | Файл | Что делает |
 | --- | --- |
-| `main.ts` | Bootstrap: создаёт Redis-клиент, `MediasoupService`, `RoomManager`, HTTP-сервер (`/health`, `/ready`) и `WebSocketServer` (`/ws`), `SocketGateway`. Graceful shutdown (SIGINT/SIGTERM). |
+| `main.ts` | Bootstrap: создаёт Redis-клиент, `MediasoupService`, `RoomManager`, HTTP-сервер (`/health`, `/ready`, `/metrics`) и `WebSocketServer` (`/ws`), `SocketGateway`. Graceful shutdown (SIGINT/SIGTERM). |
 | `config.ts` | `readSignalingConfig()` — собирает конфиг из env (port, redis, WS-лимиты, mediasoup, ICE/TURN). |
 | `env.ts` | Хелперы чтения env (`readEnv`, `readNumberEnv`). |
 | `logger.ts` | JSON-логгер (`createLogger`): info/warn/error с контекстом. |

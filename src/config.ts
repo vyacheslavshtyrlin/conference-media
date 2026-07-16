@@ -36,15 +36,14 @@ export type SignalingConfig = {
 
 export function readSignalingConfig(): SignalingConfig {
   const announcedIp = process.env.MEDIASOUP_ANNOUNCED_IP;
-
-  return {
+  const config: SignalingConfig = {
     port: readNumberEnv("PORT", 4000),
     redisUrl: readEnv("REDIS_URL", "redis://localhost:6379"),
     joinTokenSecret: readEnv(
       "JOIN_TOKEN_SECRET",
       "change-me-for-local-development",
     ),
-    roomEmptyGraceMs: readNumberEnv("ROOM_EMPTY_GRACE_MS", 60_000),
+    roomEmptyGraceMs: readPositiveNumberEnv("ROOM_EMPTY_GRACE_MS", 60_000),
     shutdownTimeoutMs: readPositiveNumberEnv("SHUTDOWN_TIMEOUT_MS", 10_000),
     mediaLease: {
       ttlMs: readPositiveNumberEnv("MEDIA_LEASE_TTL_MS", 15_000),
@@ -92,12 +91,43 @@ export function readSignalingConfig(): SignalingConfig {
       iceServers: readIceServers(),
     },
   };
+
+  validateSignalingConfig(config);
+  return config;
+}
+
+export function validateSignalingConfig(config: SignalingConfig): void {
+  assertPort("PORT", config.port);
+  assertPort("MEDIASOUP_RTC_MIN_PORT", config.mediasoup.rtcMinPort);
+  assertPort("MEDIASOUP_RTC_MAX_PORT", config.mediasoup.rtcMaxPort);
+
+  if (config.mediasoup.rtcMinPort > config.mediasoup.rtcMaxPort) {
+    throw new Error("MEDIASOUP_RTC_MIN_PORT must not be greater than MEDIASOUP_RTC_MAX_PORT");
+  }
+  if (config.mediaLease.refreshMs >= config.mediaLease.ttlMs) {
+    throw new Error("MEDIA_LEASE_REFRESH_MS must be less than MEDIA_LEASE_TTL_MS");
+  }
+
+  try {
+    const redisUrl = new URL(config.redisUrl);
+    if (redisUrl.protocol !== "redis:" && redisUrl.protocol !== "rediss:") {
+      throw new Error("unsupported protocol");
+    }
+  } catch {
+    throw new Error("REDIS_URL must be a valid redis:// or rediss:// URL");
+  }
+}
+
+function assertPort(name: string, value: number): void {
+  if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+    throw new Error(`Environment variable ${name} must be an integer between 1 and 65535`);
+  }
 }
 
 function readPositiveNumberEnv(name: string, fallback: number): number {
   const value = readNumberEnv(name, fallback);
-  if (value <= 0) {
-    throw new Error(`Environment variable ${name} must be greater than 0`);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`Environment variable ${name} must be a positive integer`);
   }
 
   return value;

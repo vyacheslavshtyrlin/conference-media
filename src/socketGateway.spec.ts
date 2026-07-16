@@ -470,6 +470,38 @@ describe("SocketGateway chat protocol", () => {
     expect(roomManager.sendChatMessage).not.toHaveBeenCalled();
   });
 
+  it("logs command correlation and classifies contract failures as client errors", async () => {
+    const { roomManager, url } = await createTestGateway();
+    const alice = await connectClient(url, joinPayload("peer_a", "Alice"));
+    vi.mocked(logger.warn).mockClear();
+    roomManager.sendChatMessage.mockRejectedValueOnce(
+      new SignalingError("INVALID_PAYLOAD", "Chat is unavailable"),
+    );
+    const responsePromise = waitForMessage(
+      alice,
+      (message) => message.type === "response" && message.requestId === "command_correlation",
+    );
+
+    alice.send(JSON.stringify({ type: "chat:send", requestId: "command_correlation", text: "hello" }));
+
+    await expect(responsePromise).resolves.toMatchObject({
+      ok: false,
+      error: { code: "INVALID_PAYLOAD" },
+    });
+    expect(logger.warn).toHaveBeenCalledWith(
+      "websocket command failed",
+      expect.objectContaining({
+        operation: "chat:send",
+        commandId: "command_correlation",
+        roomId: room.roomId,
+        participantId: "peer_a",
+        errorCode: "INVALID_PAYLOAD",
+        outcome: "client_error",
+        durationMs: expect.any(Number),
+      }),
+    );
+  });
+
   it("accepts chat text at the configured maximum length", async () => {
     const { roomManager, url } = await createTestGateway();
     const alice = await connectClient(url, joinPayload("peer_a", "Alice"));

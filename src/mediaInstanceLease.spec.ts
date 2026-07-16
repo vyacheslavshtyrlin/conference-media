@@ -61,4 +61,15 @@ describe("MediaInstanceLease", () => {
     expect(onLost).toHaveBeenCalledOnce();
     expect(MEDIA_LEASE_KEY).toBe("media:lease");
   });
+
+  it("reports unhealthy when its locally owned lease has expired", async () => {
+    const redis = new FakeRedisLeaseClient();
+    let now = 0;
+    const lease = new MediaInstanceLease(redis, 1_000, 100, undefined, () => now);
+    await lease.acquire();
+
+    now = 1_000;
+
+    expect(lease.isHealthy()).toBe(false);
+  });
 });

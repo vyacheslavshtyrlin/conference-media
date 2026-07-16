@@ -47,6 +47,7 @@ export class MediaInstanceLease {
     private readonly ttlMs: number,
     private readonly refreshMs: number,
     private readonly logger?: Logger,
+    private readonly now: () => number = Date.now,
   ) {}
 
   setLostCallback(callback: (error: Error) => void): void {
@@ -75,7 +76,7 @@ export class MediaInstanceLease {
   }
 
   isHealthy(): boolean {
-    return this.healthy;
+    return this.healthy && this.record !== undefined && Date.parse(this.record.expiresAt) > this.now();
   }
 
   getEpoch(): string {
@@ -111,7 +112,7 @@ export class MediaInstanceLease {
 
     const nextRecord: MediaLeaseRecord = {
       ...this.record,
-      expiresAt: new Date(Date.now() + this.ttlMs).toISOString(),
+      expiresAt: new Date(this.now() + this.ttlMs).toISOString(),
     };
     const nextSerializedRecord = JSON.stringify(nextRecord);
     const result = await this.redis.eval(refreshLeaseScript, {
@@ -127,7 +128,7 @@ export class MediaInstanceLease {
   }
 
   private createRecord(): MediaLeaseRecord {
-    const issuedAt = new Date();
+    const issuedAt = new Date(this.now());
     return {
       mediaEpoch: `media_${randomUUID()}`,
       issuedAt: issuedAt.toISOString(),
@@ -142,7 +143,11 @@ export class MediaInstanceLease {
 
     this.stopRefreshTimer();
     this.healthy = false;
-    this.logger?.error("media process lease lost", { error: error.message });
+    this.logger?.error("media process lease lost", {
+      operation: "mediaLease.refresh",
+      errorCode: "MEDIA_LEASE_LOST",
+      error: error.message,
+    });
     this.onLostCallback?.(error);
   }
 

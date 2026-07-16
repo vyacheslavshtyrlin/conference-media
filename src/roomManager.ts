@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import { SignalingError } from "./errors.js";
 import type { Logger } from "./logger.js";
 import type { MediasoupService } from "./mediasoupService.js";
+import { getMediaMetrics, type MediaMetrics } from "./metrics.js";
 import { PeerManager } from "./peerManager.js";
 import type { RedisRoomRepository } from "./redisRoomRepository.js";
 import type { JoinTokenPayload } from "./token.js";
@@ -44,6 +45,7 @@ export class RoomManager {
     private readonly logger?: Logger,
     private readonly getMediaEpoch: () => string = () => "test-media-epoch",
     private readonly isMediaLeaseHealthy: () => boolean = () => true,
+    private readonly metrics: MediaMetrics = getMediaMetrics(),
   ) {
     mediasoup.setRoomDeadCallback((roomId, reason) => {
       this.handleRoomDead(roomId, reason);
@@ -108,6 +110,8 @@ export class RoomManager {
         chatMessages = await this.repository.listChatMessages(metadata.roomId);
       } catch (error) {
         this.logger?.warn("chat history read failed during room join", {
+          operation: "room.join.chatHistory",
+          errorCode: "CHAT_HISTORY_READ_FAILED",
           roomId: metadata.roomId,
           participantId: participant.participantId,
           error: String(error),
@@ -124,6 +128,15 @@ export class RoomManager {
           chatMessages = [...chatMessages, joinMessage].slice(-CHAT_HISTORY_LIMIT);
         }
       }
+
+      this.logger?.info("room join completed", {
+        operation: "room.join",
+        roomId: metadata.roomId,
+        participantId: participant.participantId,
+        participantCount: state.peers.count(),
+        alreadyJoined,
+        outcome: "ok",
+      });
 
       return {
         room: metadata,
@@ -212,6 +225,8 @@ export class RoomManager {
             }
           }).catch((error: unknown) => {
             this.logger?.warn("producer close reconciliation failed", {
+              operation: "producer.close.reconcile",
+              errorCode: "PRODUCER_RECONCILIATION_FAILED",
               roomId,
               participantId,
               producerId,
@@ -272,6 +287,14 @@ export class RoomManager {
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
       await this.repository.closeRoom(state.metadata, "closed_by_creator");
+      this.metrics.recordRoomCleanup({ operation: "creator_close", outcome: "ok", reason: "closed_by_creator" });
+      this.logger?.info("room closed by creator", {
+        operation: "room.close.creator",
+        roomId,
+        participantId,
+        reason: "closed_by_creator",
+        outcome: "ok",
+      });
       this.roomLocks.delete(roomId);
     });
   }
@@ -440,6 +463,15 @@ export class RoomManager {
         }, this.emptyGraceMs);
       }
 
+      this.logger?.info("room leave completed", {
+        operation: "room.leave",
+        roomId,
+        participantId,
+        participantCount: state.peers.count(),
+        scheduledEmptyCleanup: state.peers.count() === 0,
+        outcome: "ok",
+      });
+
       return { participant, chatMessage };
     });
   }
@@ -459,12 +491,26 @@ export class RoomManager {
       this.rooms.delete(roomId);
       try {
         await this.repository.closeRoom(state.metadata, reason);
+        this.metrics.recordRoomCleanup({ operation: "room_dead", outcome: "ok", reason });
+        this.logger?.error("room closed after mediasoup failure", {
+          operation: "room.dead.cleanup",
+          errorCode: reason === "media_server_error" ? "MEDIA_SERVER_ERROR" : "ROOM_CLOSED_BY_SERVER",
+          roomId,
+          reason,
+          outcome: "ok",
+        });
       } finally {
         this.onRoomClosedCallback?.(roomId, reason);
         this.roomLocks.delete(roomId);
       }
     }).catch((error: unknown) => {
-      this.logger?.error("handleRoomDead cleanup failed", { roomId, error: String(error) });
+      this.metrics.recordRoomCleanup({ operation: "room_dead", outcome: "failure", reason });
+      this.logger?.error("handleRoomDead cleanup failed", {
+        operation: "room.dead.cleanup",
+        errorCode: "ROOM_CLEANUP_FAILED",
+        roomId,
+        error: String(error),
+      });
     });
   }
 
@@ -587,6 +633,7 @@ export class RoomManager {
         roomId,
         participantId,
         operation,
+        errorCode: "SYSTEM_CHAT_APPEND_FAILED",
         error: String(error),
       });
       return undefined;
@@ -612,6 +659,8 @@ export class RoomManager {
         await this.repository.removeParticipant(roomId, participantId);
       } catch (error) {
         this.logger?.warn("failed to remove participant after failed join", {
+          operation: "room.join.rollback",
+          errorCode: "PARTICIPANT_REMOVE_FAILED",
           roomId,
           participantId,
           error: String(error),
@@ -629,6 +678,8 @@ export class RoomManager {
           state.metadata = await this.repository.markRoomEmpty(state.metadata);
         } catch (error) {
           this.logger?.warn("failed to restore empty room TTL after failed join", {
+            operation: "room.join.rollback",
+            errorCode: "ROOM_EMPTY_TTL_RESTORE_FAILED",
             roomId,
             participantId,
             error: String(error),
@@ -637,6 +688,15 @@ export class RoomManager {
       }
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
+      this.metrics.recordRoomCleanup({ operation: "join_rollback", outcome: "ok" });
+      this.logger?.warn("room join rolled back", {
+        operation: "room.join.rollback",
+        roomId,
+        participantId,
+        participantSaved,
+        restoreEmptyTtl,
+        outcome: "ok",
+      });
     }
   }
 
@@ -649,6 +709,12 @@ export class RoomManager {
 
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
+      this.metrics.recordRoomCleanup({ operation: "empty_room", outcome: "ok" });
+      this.logger?.info("empty room runtime cleaned up", {
+        operation: "room.empty.cleanup",
+        roomId,
+        outcome: "ok",
+      });
       // Fix 2: delete lock after the await so no concurrent join sneaks in via a fresh mutex
       this.roomLocks.delete(roomId);
     });
@@ -671,6 +737,8 @@ export class RoomManager {
             await this.repository.removeParticipant(roomId, participant.participantId);
           } catch (error) {
             this.logger?.warn("shutdown participant cleanup failed", {
+              operation: "service.shutdown.participantCleanup",
+              errorCode: "PARTICIPANT_REMOVE_FAILED",
               roomId,
               participantId: participant.participantId,
               error: String(error),
@@ -680,11 +748,22 @@ export class RoomManager {
         try {
           state.metadata = await this.repository.markRoomEmpty(state.metadata);
         } catch (error) {
-          this.logger?.warn("shutdown empty-room transition failed", { roomId, error: String(error) });
+          this.logger?.warn("shutdown empty-room transition failed", {
+            operation: "service.shutdown.emptyRoom",
+            errorCode: "ROOM_EMPTY_TRANSITION_FAILED",
+            roomId,
+            error: String(error),
+          });
         }
         this.mediasoup.closeRoom(roomId);
         this.rooms.delete(roomId);
         this.roomLocks.delete(roomId);
+        this.metrics.recordRoomCleanup({ operation: "shutdown", outcome: "ok", reason: "server_shutdown" });
+        this.logger?.info("shutdown room cleanup completed", {
+          operation: "service.shutdown.roomCleanup",
+          roomId,
+          outcome: "ok",
+        });
       });
     }
   }
@@ -708,5 +787,17 @@ export class RoomManager {
     const lock = new Mutex();
     this.roomLocks.set(roomId, lock);
     return lock;
+  }
+
+  getRuntimeStats(): { activeRooms: number; activeParticipants: number } {
+    let activeParticipants = 0;
+    for (const state of this.rooms.values()) {
+      activeParticipants += state.peers.count();
+    }
+
+    return {
+      activeRooms: this.rooms.size,
+      activeParticipants,
+    };
   }
 }
