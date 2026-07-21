@@ -28,6 +28,7 @@ const room: RoomMetadata = {
   expiresAt: null,
   status: "active",
   closedReason: null,
+  accessPolicy: "link",
 };
 
 const logger: Logger = {

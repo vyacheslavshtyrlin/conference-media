@@ -9,7 +9,7 @@ const joinTokenPayloadSchema = z.object({
   displayName: z.string().trim().min(1).max(80),
   isCreator: z.boolean().default(false),
   exp: z.number().int().positive().optional(),
-});
+}).strict();
 
 export type JoinTokenPayload = z.infer<typeof joinTokenPayloadSchema>;
 

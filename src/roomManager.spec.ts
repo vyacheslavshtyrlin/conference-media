@@ -15,6 +15,7 @@ const room: RoomMetadata = {
   expiresAt: null,
   status: "active",
   closedReason: null,
+  accessPolicy: "link",
 };
 
 class FakeRepository {
@@ -27,6 +28,7 @@ class FakeRepository {
   failAppendChatMessage = false;
   failListChatMessages = false;
   failCloseRoom = false;
+  failSaveParticipant = false;
   readonly participants = new Map<string, Participant>();
   readonly chatMessages: ChatMessage[] = [];
   room: RoomMetadata = room;
@@ -46,6 +48,9 @@ class FakeRepository {
   }
 
   async saveParticipant(_roomId: string, participant: Participant): Promise<void> {
+    if (this.failSaveParticipant) {
+      throw new Error("redis save participant failed");
+    }
     this.participants.set(participant.participantId, participant);
   }
 
@@ -257,6 +262,38 @@ describe("RoomManager", () => {
     expect(repository.participants.get("peer_1")?.media.mic).toBe("off");
   });
 
+  it("uses the trusted token display name for admission participants without copying external identity", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(repository as unknown as RedisRoomRepository, mediasoup as unknown as MediasoupService, 60_000);
+    const payload = {
+      ...createCreatorPayload("peer_manager"),
+      displayName: "Trusted Manager",
+      externalSubject: "crm-user-42",
+      admissionCode: "opaque-admission-code",
+    } as JoinTokenPayload & { externalSubject: string; admissionCode: string };
+
+    const joined = await manager.join(payload);
+    const produced = await manager.produce(room.roomId, "peer_manager", "transport_1", "audio", {}, "mic", () => {});
+    const chatMessage = await manager.sendChatMessage(room.roomId, "peer_manager", "hello");
+
+    expect(joined.participant).toMatchObject({
+      participantId: "peer_manager",
+      displayName: "Trusted Manager",
+      isCreator: true,
+    });
+    expect(produced.participant.media.mic).toBe("on");
+    expect(chatMessage).toMatchObject({
+      kind: "user",
+      participantId: "peer_manager",
+      authorName: "Trusted Manager",
+    });
+    expect(JSON.stringify(joined)).not.toContain("crm-user-42");
+    expect(JSON.stringify(repository.participants.get("peer_manager"))).not.toContain("crm-user-42");
+    expect(JSON.stringify(repository.chatMessages)).not.toContain("crm-user-42");
+    expect(JSON.stringify(repository.participants.get("peer_manager"))).not.toContain("opaque-admission-code");
+  });
+
   it("reconciles and emits producer loss after a transport-side close", async () => {
     const repository = new FakeRepository();
     const mediasoup = new FakeMediasoupService();
@@ -410,6 +447,52 @@ describe("RoomManager", () => {
     expect(mediasoup.closeRoomCalls).toBe(0);
   });
 
+  it("rolls back a join without ghost participants when Redis participant persistence fails", async () => {
+    const repository = new FakeRepository();
+    repository.room = {
+      ...room,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      status: "active",
+      closedReason: null,
+    };
+    repository.failSaveParticipant = true;
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await expect(manager.join(createPayload("peer_1"))).rejects.toThrow("redis save participant failed");
+
+    expect(repository.participants.size).toBe(0);
+    expect(repository.emptyMarks).toBe(1);
+    expect(repository.room.expiresAt).toEqual(expect.any(String));
+    expect(mediasoup.closePeerCalls).toBe(1);
+    expect(mediasoup.closeRoomCalls).toBe(1);
+    expect(manager.getRuntimeStats()).toEqual({ activeRooms: 0, activeParticipants: 0 });
+  });
+
+  it("rejects joins while the media lease is unhealthy without creating runtime participants", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+      undefined,
+      () => "expired-media-epoch",
+      () => false,
+    );
+
+    await expect(manager.join(createPayload("peer_1"))).rejects.toMatchObject({ code: "MEDIASOUP_ERROR" });
+
+    expect(repository.activeGetRoomCalls).toBe(0);
+    expect(repository.participants.size).toBe(0);
+    expect(mediasoup.ensureRoomCalls).toBe(0);
+    expect(manager.getRuntimeStats()).toEqual({ activeRooms: 0, activeParticipants: 0 });
+  });
+
   it("activates an empty room when chat history is unavailable", async () => {
     const repository = new FakeRepository();
     repository.room = {
@@ -451,6 +534,27 @@ describe("RoomManager", () => {
     expect(repository.participants.size).toBe(0);
     expect(repository.room.expiresAt).toEqual(expect.any(String));
     expect(repository.room.status).toBe("active");
+  });
+
+  it("cleans live state during signaling shutdown so restart does not inherit ghost participants", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+    );
+
+    await manager.join(createPayload("peer_1"));
+    await manager.join(createPayload("peer_2"));
+
+    await manager.shutdown();
+
+    expect(repository.participants.size).toBe(0);
+    expect(repository.emptyMarks).toBe(1);
+    expect(mediasoup.closePeerCalls).toBe(2);
+    expect(mediasoup.closeRoomCalls).toBe(1);
+    expect(manager.getRuntimeStats()).toEqual({ activeRooms: 0, activeParticipants: 0 });
   });
 
   it("does not extend retention or repeat cleanup on duplicate leave", async () => {
@@ -657,6 +761,8 @@ describe("RoomManager", () => {
     expect(repository.closedReason).toBe("media_server_error");
     expect(repository.room.status).toBe("closed");
     expect(repository.room.closedReason).toBe("media_server_error");
+    expect(repository.participants.size).toBe(0);
+    expect(manager.getRuntimeStats()).toEqual({ activeRooms: 0, activeParticipants: 0 });
   });
 
   it("notifies sockets of worker death even if Redis room closure fails", async () => {

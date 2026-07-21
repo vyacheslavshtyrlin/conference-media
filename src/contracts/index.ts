@@ -14,7 +14,22 @@ export const healthStatusSchema = z.object({
 export type ServiceName = z.infer<typeof serviceNameSchema>;
 export type HealthStatus = z.infer<typeof healthStatusSchema>;
 
+export const appConfigResponseSchema = z.object({
+  authCookieEnabled: z.boolean(),
+  integrationApiEnabled: z.boolean(),
+  loginUrl: z.string().url().nullable(),
+  identity: z
+    .object({
+      displayName: z.string().min(1).max(80),
+      avatarUrl: z.string().url().max(512).optional(),
+    })
+    .nullable(),
+});
+
+export type AppConfigResponse = z.infer<typeof appConfigResponseSchema>;
+
 export const roomStatusSchema = z.enum(["active", "closed"]);
+export const roomAccessPolicySchema = z.enum(["link", "approval", "admission"]);
 export const roomExpiresAtSchema = z.string().datetime().nullable();
 export const roomClosedReasonSchema = z.enum([
   "closed_by_creator",
@@ -24,14 +39,18 @@ export const roomClosedReasonSchema = z.enum([
 ]);
 export const roomClosedReasonValueSchema = roomClosedReasonSchema.nullable();
 
-export const createRoomRequestSchema = z.object({}).strict();
+export const createRoomRequestSchema = z.object({
+  accessPolicy: z.enum(["link", "approval"]).optional().default("link"),
+}).strict();
 
 export const createRoomResponseSchema = z.object({
   roomId: z.string().min(1),
   slug: z.string().min(1),
   joinUrl: z.string().url(),
+  accessPolicy: roomAccessPolicySchema,
   participantId: z.string().min(1),
   roomSessionToken: z.string().min(1),
+  displayName: z.string().min(1).nullable(),
   mediaNodeId: z.string().min(1),
   signalingUrl: z.string().url(),
   expiresAt: roomExpiresAtSchema,
@@ -43,6 +62,7 @@ export const getRoomResponseSchema = z.object({
   expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
   closedReason: roomClosedReasonValueSchema.optional().default(null),
+  accessPolicy: roomAccessPolicySchema.default("link"),
   mediaNodeId: z.string().min(1),
   signalingUrl: z.string().url(),
   participantCount: z.number().int().nonnegative(),
@@ -71,7 +91,127 @@ export const roomSessionRefreshResponseSchema = z.object({
   signalingUrl: z.string().url(),
 });
 
+export const createIntegrationRoomRequestSchema = z.object({
+  externalRoomId: z.string().trim().min(1).max(128),
+  title: z.string().trim().max(160).optional(),
+  accessPolicy: z.literal("approval"),
+  initialUser: z
+    .object({
+      id: z.string().trim().min(1).max(160),
+      name: z.string().trim().min(1).max(80),
+    })
+    .optional(),
+});
+
+export const createIntegrationRoomResponseSchema = z.object({
+  roomId: z.string().min(1),
+  slug: z.string().min(1),
+  mediaNodeId: z.string().min(1),
+  signalingUrl: z.string().url(),
+  expiresAt: roomExpiresAtSchema,
+  status: roomStatusSchema,
+  accessPolicy: z.literal("approval"),
+  entryUrl: z.string().url().optional(),
+  entryExpiresAt: z.string().datetime().optional(),
+});
+
+export const integrationAdmissionIdentitySchema = z.object({
+  kind: z.enum(["guest", "authenticated"]),
+  externalSubject: z.string().trim().min(1).max(160),
+  displayName: z.string().trim().min(1).max(80),
+  avatarUrl: z.string().url().max(512).optional(),
+});
+
+export const createIntegrationAdmissionRequestSchema = z.object({
+  identity: integrationAdmissionIdentitySchema,
+  roomControls: z.enum(["creator", "none"]),
+  expiresAt: z.string().datetime(),
+});
+
+export const createIntegrationAdmissionResponseSchema = z.object({
+  entryUrl: z.string().url(),
+  expiresAt: z.string().datetime(),
+});
+
+export const createRoomAdmissionRequestSchema = z.object({
+  participantId: z.string().trim().min(1),
+  roomSessionToken: z.string().min(1),
+});
+
+export const createRoomAdmissionResponseSchema = createIntegrationAdmissionResponseSchema;
+
+export const exchangeAdmissionRequestSchema = z.object({
+  code: z.string().trim().min(1).max(256),
+  roomId: z.string().trim().min(1).optional(),
+});
+
+export const exchangeAdmissionResponseSchema = z.object({
+  roomId: z.string().min(1),
+  slug: z.string().min(1),
+  participantId: z.string().min(1),
+  roomSessionToken: z.string().min(1),
+  displayName: z.string().min(1).nullable(),
+  isCreator: z.boolean(),
+  mediaNodeId: z.string().min(1),
+  signalingUrl: z.string().url(),
+  expiresAt: roomExpiresAtSchema,
+});
+
+export const joinRequestStatusSchema = z.enum(["pending", "approved", "denied", "expired"]);
+
+export const createJoinRequestRequestSchema = z.object({
+  displayName: z.string().trim().min(1).max(80),
+});
+
+export const createJoinRequestResponseSchema = z.object({
+  requestId: z.string().min(1),
+  requestToken: z.string().min(1),
+  status: z.literal("pending"),
+  displayName: z.string().min(1),
+  expiresAt: z.string().datetime(),
+});
+
+export const joinRequestStatusRequestSchema = z.object({
+  requestToken: z.string().min(1),
+});
+
+export const joinRequestStatusResponseSchema = z.object({
+  requestId: z.string().min(1),
+  status: joinRequestStatusSchema,
+  displayName: z.string().min(1),
+  participantId: z.string().min(1).optional(),
+  roomSessionToken: z.string().min(1).optional(),
+  isCreator: z.literal(false).optional(),
+  expiresAt: z.string().datetime(),
+});
+
+export const creatorJoinRequestAuthSchema = z.object({
+  participantId: z.string().trim().min(1),
+  roomSessionToken: z.string().min(1),
+});
+
+export const listJoinRequestsRequestSchema = creatorJoinRequestAuthSchema;
+
+export const pendingJoinRequestSchema = z.object({
+  requestId: z.string().min(1),
+  displayName: z.string().min(1),
+  createdAt: z.string().datetime(),
+  expiresAt: z.string().datetime(),
+});
+
+export const listJoinRequestsResponseSchema = z.object({
+  requests: z.array(pendingJoinRequestSchema),
+});
+
+export const decideJoinRequestRequestSchema = creatorJoinRequestAuthSchema;
+
+export const decideJoinRequestResponseSchema = z.object({
+  requestId: z.string().min(1),
+  status: z.enum(["approved", "denied"]),
+});
+
 export type RoomStatus = z.infer<typeof roomStatusSchema>;
+export type RoomAccessPolicy = z.infer<typeof roomAccessPolicySchema>;
 export type RoomClosedReason = z.infer<typeof roomClosedReasonSchema>;
 export type CreateRoomRequest = z.infer<typeof createRoomRequestSchema>;
 export type CreateRoomResponse = z.infer<typeof createRoomResponseSchema>;
@@ -80,6 +220,25 @@ export type JoinRoomRequest = z.infer<typeof joinRoomRequestSchema>;
 export type JoinRoomResponse = z.infer<typeof joinRoomResponseSchema>;
 export type RoomSessionRefreshRequest = z.infer<typeof roomSessionRefreshRequestSchema>;
 export type RoomSessionRefreshResponse = z.infer<typeof roomSessionRefreshResponseSchema>;
+export type CreateIntegrationRoomRequest = z.infer<typeof createIntegrationRoomRequestSchema>;
+export type CreateIntegrationRoomResponse = z.infer<typeof createIntegrationRoomResponseSchema>;
+export type IntegrationAdmissionIdentity = z.infer<typeof integrationAdmissionIdentitySchema>;
+export type CreateIntegrationAdmissionRequest = z.infer<typeof createIntegrationAdmissionRequestSchema>;
+export type CreateIntegrationAdmissionResponse = z.infer<typeof createIntegrationAdmissionResponseSchema>;
+export type CreateRoomAdmissionRequest = z.infer<typeof createRoomAdmissionRequestSchema>;
+export type CreateRoomAdmissionResponse = z.infer<typeof createRoomAdmissionResponseSchema>;
+export type ExchangeAdmissionRequest = z.infer<typeof exchangeAdmissionRequestSchema>;
+export type ExchangeAdmissionResponse = z.infer<typeof exchangeAdmissionResponseSchema>;
+export type JoinRequestStatus = z.infer<typeof joinRequestStatusSchema>;
+export type CreateJoinRequestRequest = z.infer<typeof createJoinRequestRequestSchema>;
+export type CreateJoinRequestResponse = z.infer<typeof createJoinRequestResponseSchema>;
+export type JoinRequestStatusRequest = z.infer<typeof joinRequestStatusRequestSchema>;
+export type JoinRequestStatusResponse = z.infer<typeof joinRequestStatusResponseSchema>;
+export type ListJoinRequestsRequest = z.infer<typeof listJoinRequestsRequestSchema>;
+export type PendingJoinRequest = z.infer<typeof pendingJoinRequestSchema>;
+export type ListJoinRequestsResponse = z.infer<typeof listJoinRequestsResponseSchema>;
+export type DecideJoinRequestRequest = z.infer<typeof decideJoinRequestRequestSchema>;
+export type DecideJoinRequestResponse = z.infer<typeof decideJoinRequestResponseSchema>;
 
 export const mediaStateValueSchema = z.enum(["on", "off", "muted", "error"]);
 export const mediaSourceSchema = z.enum(["mic", "camera", "screen"]);
@@ -102,7 +261,7 @@ export const participantSchema = z.object({
   connectionState: connectionStateSchema,
   connectionQuality: participantConnectionQualitySchema,
   media: participantMediaSchema,
-});
+}).strict();
 
 export type MediaStateValue = z.infer<typeof mediaStateValueSchema>;
 export type MediaSource = z.infer<typeof mediaSourceSchema>;
@@ -121,7 +280,7 @@ export const userChatMessageSchema = z.object({
   authorName: z.string().min(1),
   text: z.string().min(1).max(CHAT_MESSAGE_TEXT_MAX_LENGTH),
   createdAt: z.string().datetime(),
-});
+}).strict();
 
 export const systemChatMessageSchema = z.object({
   messageId: z.string().min(1),
@@ -129,7 +288,7 @@ export const systemChatMessageSchema = z.object({
   kind: z.literal("system"),
   text: z.string().min(1).max(CHAT_MESSAGE_TEXT_MAX_LENGTH),
   createdAt: z.string().datetime(),
-});
+}).strict();
 
 export const chatMessageSchema = z.discriminatedUnion("kind", [
   userChatMessageSchema,
@@ -146,9 +305,16 @@ export const errorCodeSchema = z.enum([
   "ROOM_CLOSED",
   "INVALID_TOKEN",
   "INVALID_PAYLOAD",
+  "APPROVAL_REQUIRED",
+  "AUTH_NOT_CONFIGURED",
+  "INTEGRATION_AUTH_NOT_CONFIGURED",
+  "INTEGRATION_CONFLICT",
+  "INTEGRATION_FORBIDDEN",
+  "INTEGRATION_NOT_IMPLEMENTED",
   "TRANSPORT_NOT_FOUND",
   "PRODUCER_NOT_FOUND",
   "MEDIASOUP_ERROR",
+  "RATE_LIMITED",
 ]);
 
 export const ERROR_CODES = errorCodeSchema.options;
@@ -321,14 +487,14 @@ export const responseSuccessEventSchema = z.object({
   requestId: requestIdSchema,
   ok: z.literal(true),
   data: z.unknown(),
-});
+}).strict();
 
 export const responseErrorEventSchema = z.object({
   type: z.literal("response"),
   requestId: requestIdSchema,
   ok: z.literal(false),
   error: contractErrorSchema,
-});
+}).strict();
 
 export const responseEventSchema = z.discriminatedUnion("ok", [
   responseSuccessEventSchema,
@@ -340,34 +506,34 @@ export const roomSnapshotEventSchema = z.object({
   roomId: z.string().min(1),
   participants: z.array(participantSchema),
   chatMessages: z.array(chatMessageSchema),
-});
+}).strict();
 
 export const participantJoinedEventSchema = z.object({
   type: z.literal("participant:joined"),
   participant: participantSchema,
-});
+}).strict();
 
 export const participantLeftEventSchema = z.object({
   type: z.literal("participant:left"),
   participantId: z.string().min(1),
-});
+}).strict();
 
 export const participantMediaChangedEventSchema = z.object({
   type: z.literal("participant:mediaChanged"),
   participantId: z.string().min(1),
   media: participantMediaSchema,
-});
+}).strict();
 
 export const participantActiveSpeakerChangedEventSchema = z.object({
   type: z.literal("participant:activeSpeakerChanged"),
   participantId: z.string().min(1).nullable(),
-});
+}).strict();
 
 export const participantConnectionQualityChangedEventSchema = z.object({
   type: z.literal("participant:connectionQualityChanged"),
   participantId: z.string().min(1),
   quality: participantConnectionQualitySchema,
-});
+}).strict();
 
 export const participantMediaControlAppliedEventSchema = z.object({
   type: z.literal("participant:mediaControlApplied"),
@@ -377,7 +543,7 @@ export const participantMediaControlAppliedEventSchema = z.object({
   media: participantMediaSchema,
   actorParticipantId: z.string().min(1),
   actorDisplayName: z.string().min(1),
-});
+}).strict();
 
 export const participantCreatorChangedEventSchema = z.object({
   type: z.literal("participant:creatorChanged"),
@@ -386,7 +552,7 @@ export const participantCreatorChangedEventSchema = z.object({
   isCreator: z.boolean(),
   actorParticipantId: z.string().min(1),
   actorDisplayName: z.string().min(1),
-});
+}).strict();
 
 export const participantKickedEventSchema = z.object({
   type: z.literal("participant:kicked"),
@@ -394,7 +560,7 @@ export const participantKickedEventSchema = z.object({
   targetDisplayName: z.string().min(1),
   actorParticipantId: z.string().min(1),
   actorDisplayName: z.string().min(1),
-});
+}).strict();
 
 export const producerAddedEventSchema = z.object({
   type: z.literal("producer:added"),
@@ -402,24 +568,24 @@ export const producerAddedEventSchema = z.object({
   participantId: z.string().min(1),
   kind: mediaKindSchema,
   source: mediaSourceSchema,
-});
+}).strict();
 
 export const producerClosedEventSchema = z.object({
   type: z.literal("producer:closed"),
   producerId: z.string().min(1),
   participantId: z.string().min(1),
   source: mediaSourceSchema,
-});
+}).strict();
 
 export const roomClosedEventSchema = z.object({
   type: z.literal("room:closed"),
   reason: roomClosedReasonSchema,
-});
+}).strict();
 
 export const chatMessageAddedEventSchema = z.object({
   type: z.literal("chat:messageAdded"),
   message: chatMessageSchema,
-});
+}).strict();
 
 export const serverWebSocketEventSchema = z.union([
   responseEventSchema,
@@ -465,6 +631,7 @@ export const roomMetadataSchema = z.object({
   expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
   closedReason: roomClosedReasonValueSchema.optional().default(null),
+  accessPolicy: roomAccessPolicySchema.default("link"),
 });
 
 export type RoomMetadata = z.infer<typeof roomMetadataSchema>;

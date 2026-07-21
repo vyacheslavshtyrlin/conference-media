@@ -68,6 +68,7 @@ export class RedisRoomRepository {
     await this.recordRedis("persist_room_slug", () => this.redis.persist(this.slugKey(activeRoom.slug)));
     await this.recordRedis("persist_room_chat", () => this.redis.persist(this.chatKey(activeRoom.roomId)));
     await this.recordRedis("persist_room_sessions", () => this.redis.persist(this.roomSessionsKey(activeRoom.roomId)));
+    await this.syncIntegrationMappings(activeRoom.roomId, "persist");
 
     return activeRoom;
   }
@@ -150,6 +151,7 @@ export class RedisRoomRepository {
     await this.recordRedis("expire_room_slug", () => this.redis.expire(this.slugKey(emptyRoom.slug), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_chat", () => this.redis.expire(this.chatKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_sessions", () => this.redis.expire(this.roomSessionsKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.syncIntegrationMappings(emptyRoom.roomId, "expire");
     await this.recordRedis("delete_room_participants", () => this.redis.del(this.participantsKey(emptyRoom.roomId)));
 
     return emptyRoom;
@@ -170,6 +172,7 @@ export class RedisRoomRepository {
     await this.recordRedis("expire_room_slug", () => this.redis.expire(this.slugKey(closedRoom.slug), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_chat", () => this.redis.expire(this.chatKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_sessions", () => this.redis.expire(this.roomSessionsKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.syncIntegrationMappings(closedRoom.roomId, "expire");
     await this.recordRedis("delete_room_participants", () => this.redis.del(this.participantsKey(closedRoom.roomId)));
 
     return closedRoom;
@@ -213,6 +216,30 @@ export class RedisRoomRepository {
 
   private roomSessionsKey(roomId: string): string {
     return `room:${roomId}:sessions`;
+  }
+
+  private async syncIntegrationMappings(roomId: string, action: "persist" | "expire"): Promise<void> {
+    const ownerKey = `integration_room_owner:${roomId}`;
+    const rawOwner = await this.recordRedis("get_integration_room_owner", () => this.redis.get(ownerKey));
+    if (!rawOwner) return;
+
+    let owner: { integrationId?: unknown; externalRoomHash?: unknown };
+    try {
+      owner = JSON.parse(rawOwner) as { integrationId?: unknown; externalRoomHash?: unknown };
+    } catch {
+      return;
+    }
+    if (action === "persist") {
+      await this.recordRedis("persist_integration_room_owner", () => this.redis.persist(ownerKey));
+      if (typeof owner.integrationId !== "string" || typeof owner.externalRoomHash !== "string") return;
+      const externalKey = `integration_room:${owner.integrationId}:${owner.externalRoomHash}`;
+      await this.recordRedis("persist_integration_room_mapping", () => this.redis.persist(externalKey));
+      return;
+    }
+    await this.recordRedis("expire_integration_room_owner", () => this.redis.expire(ownerKey, EMPTY_ROOM_TTL_SECONDS));
+    if (typeof owner.integrationId !== "string" || typeof owner.externalRoomHash !== "string") return;
+    const externalKey = `integration_room:${owner.integrationId}:${owner.externalRoomHash}`;
+    await this.recordRedis("expire_integration_room_mapping", () => this.redis.expire(externalKey, EMPTY_ROOM_TTL_SECONDS));
   }
 }
 
