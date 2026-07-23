@@ -18,6 +18,9 @@ import { getMediaMetrics, type MediaMetrics } from "./metrics.js";
 import { PeerManager } from "./peerManager.js";
 import type { RedisRoomRepository } from "./redisRoomRepository.js";
 import type { JoinTokenPayload } from "./token.js";
+import type { RecorderProducer, RoomRecordingBridge } from "./recordingBridge.js";
+import type { BotAuthoritySnapshot, RecordingBotSessionManager } from "./recordingBot.js";
+import type { RoomHistoryBridge } from "./roomHistoryBridge.js";
 
 type RuntimeRoomState = {
   metadata: RoomMetadata;
@@ -31,6 +34,8 @@ type CreatorControlResult = {
   chatMessage?: ChatMessage;
   closedProducerIds?: string[];
 };
+
+const RECORDING_STOP_DISPATCH_TIMEOUT_MS = 5_000;
 
 export class RoomManager {
   private readonly rooms = new Map<string, RuntimeRoomState>();
@@ -46,6 +51,9 @@ export class RoomManager {
     private readonly getMediaEpoch: () => string = () => "test-media-epoch",
     private readonly isMediaLeaseHealthy: () => boolean = () => true,
     private readonly metrics: MediaMetrics = getMediaMetrics(),
+    private readonly recording?: RoomRecordingBridge,
+    private recordingBots?: RecordingBotSessionManager,
+    private readonly history?: RoomHistoryBridge,
   ) {
     mediasoup.setRoomDeadCallback((roomId, reason) => {
       this.handleRoomDead(roomId, reason);
@@ -61,6 +69,10 @@ export class RoomManager {
 
   setActiveSpeakerChangedCallback(callback: (roomId: string, participantId: string | null) => void): void {
     this.onActiveSpeakerChangedCallback = callback;
+  }
+
+  setRecordingBotSessionManager(manager: RecordingBotSessionManager): void {
+    this.recordingBots = manager;
   }
 
   async join(payload: JoinTokenPayload): Promise<{
@@ -79,6 +91,25 @@ export class RoomManager {
       state.metadata = metadata;
 
       const alreadyJoined = Boolean(state.peers.getPeer(payload.participantId));
+      const isFirstHuman = state.peers.count() === 0 && !alreadyJoined;
+      if (isFirstHuman && this.recording) {
+        try {
+          await this.recording.roomBecameLive(
+            metadata,
+            state.peers.list(),
+            this.mediasoup.listProducers(metadata.roomId),
+          );
+        } catch (error) {
+          if (shouldRestoreEmptyTtl) {
+            state.metadata = await this.repository.markRoomEmpty(state.metadata).catch(() => state.metadata);
+          }
+          this.mediasoup.closeRoom(metadata.roomId);
+          this.rooms.delete(metadata.roomId);
+          this.metrics.recordRoomCleanup({ operation: "join_rollback", outcome: "ok", reason: "recording_capacity" });
+          this.recording.logFailure("recording.capacityAdmission", metadata.roomId, error);
+          throw new SignalingError("MEDIASOUP_ERROR", "Recording capacity is temporarily unavailable");
+        }
+      }
       const participant = state.peers.addPeer(payload);
       let participantSaved = false;
 
@@ -92,6 +123,9 @@ export class RoomManager {
         participantSaved = true;
         await this.mediasoup.ensureRoom(metadata.roomId);
       } catch (error) {
+        if (isFirstHuman) {
+          await this.abortPreparedRecording(metadata.roomId);
+        }
         if (!alreadyJoined) {
           await this.rollbackFailedJoin(
             metadata.roomId,
@@ -137,6 +171,10 @@ export class RoomManager {
         alreadyJoined,
         outcome: "ok",
       });
+
+      if (!alreadyJoined) this.history?.report({ type: "participant.joined", roomId: metadata.roomId, participantId: participant.participantId, displayName: participant.displayName });
+
+      this.syncBotAuthority(metadata.roomId);
 
       return {
         room: metadata,
@@ -216,6 +254,7 @@ export class RoomManager {
         rtpParameters,
         source,
         (producerId) => {
+          this.runRecording("recording.producerClosed", roomId, () => this.recording?.producerClosed(roomId, producerId));
           void this.runExclusive(roomId, async () => {
             const runtime = this.rooms.get(roomId);
             if (!runtime) return;
@@ -223,6 +262,7 @@ export class RoomManager {
             if (reconciled.changed) {
               onClose({ producerId, source, participant: reconciled.participant });
             }
+            this.syncBotAuthority(roomId);
           }).catch((error: unknown) => {
             this.logger?.warn("producer close reconciliation failed", {
               operation: "producer.close.reconcile",
@@ -236,6 +276,14 @@ export class RoomManager {
         },
       );
       const reconciled = await this.reconcileParticipantMediaLocked(state, participantId);
+      const producer: RecorderProducer = {
+        producerId: data.id,
+        participantId,
+        kind,
+        source,
+      };
+      this.runRecording("recording.producerAdded", roomId, () => this.recording?.producerAdded(state.metadata, reconciled.participant, producer));
+      this.syncBotAuthority(roomId);
       return { ...data, participant: reconciled.participant };
     });
   }
@@ -255,6 +303,7 @@ export class RoomManager {
         this.requireRuntimeRoom(roomId),
         participantId,
       );
+      this.syncBotAuthority(roomId);
       return { ...closed, participant: reconciled.participant };
     });
   }
@@ -267,6 +316,8 @@ export class RoomManager {
         this.requireRuntimeRoom(roomId),
         participantId,
       );
+      this.runRecording("recording.producerPaused", roomId, () => this.recording?.producerPaused(roomId, producerId, paused));
+      this.syncBotAuthority(roomId);
       return { ...changed, participant: reconciled.participant };
     });
   }
@@ -284,6 +335,7 @@ export class RoomManager {
         state.cleanupTimer = undefined;
       }
 
+      await this.stopRecording(roomId);
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
       await this.repository.closeRoom(state.metadata, "closed_by_creator");
@@ -314,6 +366,7 @@ export class RoomManager {
       this.mediasoup.closePeer(roomId, targetParticipantId);
       state.peers.removePeer(targetParticipantId);
       await this.repository.removeParticipant(roomId, targetParticipantId);
+      this.syncBotAuthority(roomId);
       await this.repository.setRoomSessionCreator(roomId, targetParticipantId, false);
       const chatMessage = await this.appendSystemChatMessageBestEffort(
         roomId,
@@ -423,7 +476,7 @@ export class RoomManager {
         throw new SignalingError("INVALID_PAYLOAD", "Chat message text is invalid");
       }
 
-      return this.repository.appendChatMessage(roomId, {
+      const message = await this.repository.appendChatMessage(roomId, {
         messageId: this.createMessageId(),
         roomId,
         kind: "user",
@@ -432,6 +485,8 @@ export class RoomManager {
         text: trimmed,
         createdAt: new Date().toISOString(),
       });
+      this.history?.report({ type: "chat.message", roomId, messageId: message.messageId, kind: "user", participantId: participant.participantId, authorName: participant.displayName, text: message.text });
+      return message;
     });
   }
 
@@ -449,6 +504,7 @@ export class RoomManager {
 
       this.mediasoup.closePeer(roomId, participantId);
       await this.repository.removeParticipant(roomId, participantId);
+      this.syncBotAuthority(roomId);
       const chatMessage = await this.appendSystemChatMessageBestEffort(
         roomId,
         `${participant.displayName} покинул конференцию`,
@@ -458,6 +514,7 @@ export class RoomManager {
 
       if (state.peers.count() === 0) {
         state.metadata = await this.repository.markRoomEmpty(state.metadata);
+        await this.stopRecording(roomId);
         state.cleanupTimer = setTimeout(() => {
           void this.closeEmptyRoom(roomId);
         }, this.emptyGraceMs);
@@ -490,6 +547,7 @@ export class RoomManager {
 
       this.rooms.delete(roomId);
       try {
+        await this.stopRecording(roomId);
         await this.repository.closeRoom(state.metadata, reason);
         this.metrics.recordRoomCleanup({ operation: "room_dead", outcome: "ok", reason });
         this.logger?.error("room closed after mediasoup failure", {
@@ -707,6 +765,7 @@ export class RoomManager {
         return;
       }
 
+      await this.stopRecording(roomId);
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
       this.metrics.recordRoomCleanup({ operation: "empty_room", outcome: "ok" });
@@ -755,6 +814,7 @@ export class RoomManager {
             error: String(error),
           });
         }
+        await this.stopRecording(roomId);
         this.mediasoup.closeRoom(roomId);
         this.rooms.delete(roomId);
         this.roomLocks.delete(roomId);
@@ -770,6 +830,35 @@ export class RoomManager {
 
   private runExclusive<T>(roomId: string, operation: () => Promise<T>): Promise<T> {
     return this.getRoomLock(roomId).runExclusive(operation);
+  }
+
+  private runRecording(operation: string, roomId: string, action: () => Promise<void> | undefined): void {
+    void action()?.catch((error: unknown) => {
+      this.recording?.logFailure(operation, roomId, error);
+    });
+  }
+
+  private async stopRecording(roomId: string): Promise<void> {
+    this.recordingBots?.stopRoom(roomId);
+    if (!this.recording) return;
+    try {
+      await withTimeout(this.recording.stopRoom(roomId), RECORDING_STOP_DISPATCH_TIMEOUT_MS);
+    } catch (error) {
+      this.recording.logFailure("recording.stop", roomId, error);
+    }
+  }
+
+  private async abortPreparedRecording(roomId: string): Promise<void> {
+    if (!this.recording) return;
+    try {
+      if (this.recording.abortPrepared) {
+        await withTimeout(this.recording.abortPrepared(roomId), RECORDING_STOP_DISPATCH_TIMEOUT_MS);
+      } else {
+        await withTimeout(this.recording.stopRoom(roomId), RECORDING_STOP_DISPATCH_TIMEOUT_MS);
+      }
+    } catch (error) {
+      this.recording.logFailure("recording.abortPrepared", roomId, error);
+    }
   }
 
   private assertMediaLeaseHealthy(): void {
@@ -799,5 +888,41 @@ export class RoomManager {
       activeRooms: this.rooms.size,
       activeParticipants,
     };
+  }
+
+  freezeBotAuthoritySnapshot(roomId: string, accept: (snapshot: BotAuthoritySnapshot) => void): Promise<void> {
+    return this.runExclusive(roomId, async () => {
+      accept(this.buildBotAuthoritySnapshot(roomId));
+    });
+  }
+
+  private buildBotAuthoritySnapshot(roomId: string): BotAuthoritySnapshot {
+    const state = this.requireRuntimeRoom(roomId);
+    const participants = state.peers.list().map(({ participantId, displayName }) => ({ participantId, displayName }));
+    const names = new Map(participants.map((participant) => [participant.participantId, participant.displayName]));
+    const producers = this.mediasoup.listProducers(roomId).flatMap((producer) => {
+      const displayName = names.get(producer.participantId);
+      return displayName ? [{ ...producer, displayName }] : [];
+    });
+    return { participants, producers };
+  }
+
+  private syncBotAuthority(roomId: string): void {
+    if (!this.recordingBots) return;
+    this.recordingBots.syncAuthority(roomId, this.buildBotAuthoritySnapshot(roomId));
+  }
+}
+
+async function withTimeout<T>(operation: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`Recording stop dispatch timed out after ${timeoutMs}ms`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }

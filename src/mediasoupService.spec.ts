@@ -15,7 +15,9 @@ vi.mock("mediasoup", () => ({
 type FakeProducer = {
   id: string;
   kind: "audio" | "video";
+  type: "simple" | "simulcast" | "svc";
   observer: EventEmitter;
+  paused: boolean;
   close: () => void;
 };
 
@@ -23,8 +25,12 @@ type FakeConsumer = {
   id: string;
   kind: "audio" | "video";
   rtpParameters: Record<string, unknown>;
+  paused: boolean;
   observer: EventEmitter;
   close: () => void;
+  pause: () => Promise<void>;
+  resume: () => Promise<void>;
+  setPreferredLayers: (layers: { spatialLayer: number; temporalLayer?: number }) => Promise<void>;
 };
 
 type FakeAudioLevelObserver = EventEmitter & {
@@ -38,6 +44,11 @@ let producerCounter = 0;
 let consumerCounter = 0;
 let fakeAudioLevelObservers: FakeAudioLevelObserver[] = [];
 let fakeAudioLevelObserverOptions: Array<Record<string, unknown>> = [];
+let fakeTransportConnections: Array<{ ip?: string; port?: number }> = [];
+let fakeRouters: unknown[] = [];
+let fakePreferredLayers: Array<{ spatialLayer: number; temporalLayer?: number }> = [];
+let fakeConsumerPaused: boolean[] = [];
+let nextFakeProducerType: FakeProducer["type"] = "simple";
 
 function createFakeWorker() {
   const worker = new EventEmitter() as EventEmitter & {
@@ -54,7 +65,7 @@ function createFakeWorker() {
 }
 
 function createFakeRouter() {
-  return {
+  const router = {
     rtpCapabilities: {},
     canConsume: () => true,
     createAudioLevelObserver: async (options: Record<string, unknown>) => {
@@ -63,6 +74,8 @@ function createFakeRouter() {
     },
     createWebRtcTransport: async () => createFakeTransport(),
   };
+  fakeRouters.push(router);
+  return router;
 }
 
 function createFakeAudioLevelObserver(): FakeAudioLevelObserver {
@@ -85,9 +98,14 @@ function createFakeTransport() {
     dtlsParameters: {},
     observer: new EventEmitter(),
     closed: false,
-    connect: async () => {},
+    connect: async (parameters: { ip?: string; port?: number }) => {
+      fakeTransportConnections.push(parameters);
+    },
     produce: async ({ kind }: { kind: "audio" | "video" }) => createFakeProducer(kind),
-    consume: async ({ producerId }: { producerId: string }) => createFakeConsumer(producerId),
+    consume: async ({ producerId, paused }: { producerId: string; paused?: boolean }) => {
+      fakeConsumerPaused.push(paused ?? false);
+      return createFakeConsumer(producerId, paused ?? false);
+    },
     close() {
       this.closed = true;
       this.observer.emit("close");
@@ -99,39 +117,55 @@ function createFakeProducer(kind: "audio" | "video"): FakeProducer {
   const producer: FakeProducer = {
     id: `producer_${++producerCounter}`,
     kind,
+    type: nextFakeProducerType,
     observer: new EventEmitter(),
-    close: () => {
+    paused: false,
+    close: vi.fn(() => {
       producer.observer.emit("close");
-    },
+    }),
   };
   return producer;
 }
 
-function createFakeConsumer(_producerId: string): FakeConsumer {
+function createFakeConsumer(_producerId: string, paused: boolean): FakeConsumer {
   const consumer: FakeConsumer = {
     id: `consumer_${++consumerCounter}`,
     kind: "video",
     rtpParameters: {},
+    paused,
     observer: new EventEmitter(),
-    close: () => {
+    close: vi.fn(() => {
       consumer.observer.emit("close");
+    }),
+    pause: async () => {
+      consumer.paused = true;
+    },
+    resume: async () => {
+      consumer.paused = false;
+    },
+    setPreferredLayers: async (layers) => {
+      fakePreferredLayers.push(layers);
     },
   };
   return consumer;
 }
 
 async function createService(overrides: Partial<ConstructorParameters<typeof MediasoupService>[0]> = {}) {
-  const service = new MediasoupService({
-    numWorkers: 1,
-    listenIp: "127.0.0.1",
-    rtcMinPort: 40000,
-    rtcMaxPort: 49999,
-    maxTransportsPerPeer: 4,
-    maxProducersPerPeer: 3,
-    maxConsumersPerPeer: 32,
-    iceServers: [],
-    ...overrides,
-  });
+  const service = new MediasoupService(
+    {
+      numWorkers: 1,
+      listenIp: "127.0.0.1",
+      rtcMinPort: 40000,
+      rtcMaxPort: 49999,
+      maxTransportsPerPeer: 4,
+      maxProducersPerPeer: 3,
+      maxConsumersPerPeer: 32,
+      iceServers: [],
+      ...overrides,
+    },
+    undefined,
+    undefined,
+  );
   await service.init();
   return service;
 }
@@ -143,7 +177,29 @@ describe("MediasoupService", () => {
     consumerCounter = 0;
     fakeAudioLevelObservers = [];
     fakeAudioLevelObserverOptions = [];
-    createWorker.mockResolvedValue(createFakeWorker());
+    fakeTransportConnections = [];
+    fakeRouters = [];
+    fakePreferredLayers = [];
+    fakeConsumerPaused = [];
+    nextFakeProducerType = "simple";
+    createWorker.mockImplementation(async () => createFakeWorker());
+  });
+
+  it("does not create a recording worker when recording is disabled", async () => {
+    const service = new MediasoupService({
+      numWorkers: 1,
+      listenIp: "127.0.0.1",
+      rtcMinPort: 40000,
+      rtcMaxPort: 49999,
+      maxTransportsPerPeer: 4,
+      maxProducersPerPeer: 3,
+      maxConsumersPerPeer: 32,
+      iceServers: [],
+    });
+
+    await service.init();
+
+    expect(createWorker).toHaveBeenCalledTimes(1);
   });
 
   it("configures active speaker detection to ignore quiet background noise", async () => {
@@ -171,6 +227,33 @@ describe("MediasoupService", () => {
     service.closePeer("room_1", "peer_1");
 
     expect(service.getRuntimeStats()).toMatchObject({ producers: 0, consumers: 0 });
+  });
+
+  it("keeps one idempotent bot receive transport/consumer and tears it down without touching the live room", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const camera = await service.produce("room_1", "peer_1", sendTransport.id, "video", {}, "camera", () => {});
+    const [firstTransport, secondTransport] = await Promise.all([
+      service.createBotRecvTransport("room_1", "rec_1"),
+      service.createBotRecvTransport("room_1", "rec_1"),
+    ]);
+
+    const [firstConsumer, secondConsumer] = await Promise.all([
+      service.consumeForBot("room_1", "rec_1", firstTransport.id, camera.id, {}),
+      service.consumeForBot("room_1", "rec_1", firstTransport.id, camera.id, {}),
+    ]);
+
+    expect(secondTransport.id).toBe(firstTransport.id);
+    expect(transportCounter).toBe(2);
+    expect(secondConsumer.id).toBe(firstConsumer.id);
+    expect(firstConsumer.paused).toBe(true);
+    expect(secondConsumer.paused).toBe(true);
+    expect(fakeConsumerPaused).toEqual([true]);
+
+    service.closeBotSession("room_1", "rec_1");
+    expect(service.getRuntimeStats()).toMatchObject({ rooms: 1, producers: 1, transports: 1 });
+    expect(service.listProducers("room_1")).toContainEqual(expect.objectContaining({ producerId: camera.id }));
+    await expect(service.closeProducer("room_1", "peer_1", camera.id)).resolves.toMatchObject({ producerId: camera.id });
   });
 
   it("enforces per-peer producer limits", async () => {
@@ -283,4 +366,5 @@ describe("MediasoupService", () => {
     expect(service.getRuntimeStats().workers).toBe(0);
     expect(service.isReady()).toBe(false);
   });
+
 });

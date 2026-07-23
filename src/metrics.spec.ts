@@ -37,6 +37,7 @@ describe("media metrics", () => {
       transports: 8,
       producers: 6,
       consumers: 12,
+      recordingWorkerSlots: { total: 4, available: 1, occupied: 3, healthyWorkers: 2 },
     });
 
     expect(body).toContain("signaling_active_rooms 2");
@@ -44,6 +45,10 @@ describe("media metrics", () => {
     expect(body).toContain("signaling_active_sockets 4");
     expect(body).toContain("mediasoup_workers 2");
     expect(body).toContain("mediasoup_transports 8");
+    expect(body).toContain("recording_worker_slots_total 4");
+    expect(body).toContain("recording_worker_slots_available 1");
+    expect(body).toContain("recording_worker_slots_occupied 3");
+    expect(body).toContain("recording_workers_healthy 2");
     expect(body).toContain('signaling_websocket_connects_total{error_code="none",outcome="ok"} 1');
     expect(body).toContain(
       'signaling_websocket_commands_total{error_code="INVALID_PAYLOAD",operation="chat:send",outcome="client_error"} 1',

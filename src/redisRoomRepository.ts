@@ -223,23 +223,45 @@ export class RedisRoomRepository {
     const rawOwner = await this.recordRedis("get_integration_room_owner", () => this.redis.get(ownerKey));
     if (!rawOwner) return;
 
-    let owner: { integrationId?: unknown; externalRoomHash?: unknown };
+    let owner: { integrationId?: unknown; externalRoomHash?: unknown; recordingId?: unknown };
     try {
-      owner = JSON.parse(rawOwner) as { integrationId?: unknown; externalRoomHash?: unknown };
+      owner = JSON.parse(rawOwner) as { integrationId?: unknown; externalRoomHash?: unknown; recordingId?: unknown };
     } catch {
       return;
     }
     if (action === "persist") {
       await this.recordRedis("persist_integration_room_owner", () => this.redis.persist(ownerKey));
+      if (typeof owner.recordingId === "string" && owner.recordingId.length > 0) {
+        await this.syncRecordingControlMappings(owner.recordingId, "persist");
+      }
       if (typeof owner.integrationId !== "string" || typeof owner.externalRoomHash !== "string") return;
       const externalKey = `integration_room:${owner.integrationId}:${owner.externalRoomHash}`;
       await this.recordRedis("persist_integration_room_mapping", () => this.redis.persist(externalKey));
       return;
     }
     await this.recordRedis("expire_integration_room_owner", () => this.redis.expire(ownerKey, EMPTY_ROOM_TTL_SECONDS));
+    if (typeof owner.recordingId === "string" && owner.recordingId.length > 0) {
+      await this.syncRecordingControlMappings(owner.recordingId, "expire");
+    }
     if (typeof owner.integrationId !== "string" || typeof owner.externalRoomHash !== "string") return;
     const externalKey = `integration_room:${owner.integrationId}:${owner.externalRoomHash}`;
     await this.recordRedis("expire_integration_room_mapping", () => this.redis.expire(externalKey, EMPTY_ROOM_TTL_SECONDS));
+  }
+
+  private async syncRecordingControlMappings(recordingId: string, action: "persist" | "expire"): Promise<void> {
+    const keys = [
+      `integration_recording:${recordingId}`,
+      `recording_activation:${recordingId}`,
+      `recording_finalizing:${recordingId}`,
+    ];
+
+    for (const key of keys) {
+      if (action === "persist") {
+        await this.recordRedis("persist_recording_control_mapping", () => this.redis.persist(key));
+      } else {
+        await this.recordRedis("expire_recording_control_mapping", () => this.redis.expire(key, EMPTY_ROOM_TTL_SECONDS));
+      }
+    }
   }
 }
 

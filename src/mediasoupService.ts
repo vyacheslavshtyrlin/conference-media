@@ -37,6 +37,13 @@ type ConsumerRecord = {
   producerId: string;
 };
 
+type BotSessionRecord = {
+  transport?: WebRtcTransport;
+  transportPromise?: Promise<WebRtcTransport>;
+  consumers: Map<string, Consumer>;
+  consumerPromises: Map<string, Promise<Consumer>>;
+};
+
 type RuntimeRoom = {
   workerIndex: number;
   router: Router;
@@ -45,6 +52,7 @@ type RuntimeRoom = {
   transports: Map<string, TransportRecord>;
   producers: Map<string, ProducerRecord>;
   consumers: Map<string, ConsumerRecord>;
+  botSessions: Map<string, BotSessionRecord>;
 };
 
 const mediaCodecs = [
@@ -140,6 +148,7 @@ export class MediasoupService {
       transports: new Map(),
       producers: new Map(),
       consumers: new Map(),
+      botSessions: new Map(),
     };
 
     audioLevelObserver.on("volumes", ([volume]) => {
@@ -414,6 +423,129 @@ export class MediasoupService {
     };
   }
 
+  async createBotRecvTransport(roomId: string, recordingId: string): Promise<CreateWebRtcTransportResponseData> {
+    const room = await this.ensureRoom(roomId);
+    const session = room.botSessions.get(recordingId) ?? {
+      consumers: new Map<string, Consumer>(),
+      consumerPromises: new Map<string, Promise<Consumer>>(),
+    };
+    room.botSessions.set(recordingId, session);
+    if (session.transport && !session.transport.closed) {
+      return this.describeWebRtcTransport(session.transport);
+    }
+    if (!session.transportPromise) {
+      session.transportPromise = room.router.createWebRtcTransport({
+        listenIps: [{ ip: this.config.listenIp, announcedIp: this.config.announcedIp }],
+        enableUdp: true,
+        enableTcp: true,
+        preferTcp: true,
+        initialAvailableOutgoingBitrate: 1_000_000,
+      });
+    }
+    const pending = session.transportPromise;
+    let transport: WebRtcTransport;
+    try {
+      transport = await pending;
+    } finally {
+      if (session.transportPromise === pending) session.transportPromise = undefined;
+    }
+    if (room.botSessions.get(recordingId) !== session) {
+      transport.close();
+      throw new SignalingError("TRANSPORT_NOT_FOUND", "Bot session was closed");
+    }
+    if (session.transport === transport) return this.describeWebRtcTransport(transport);
+    session.transport = transport;
+    transport.observer.once("close", () => {
+      if (session.transport === transport) session.transport = undefined;
+      for (const consumer of session.consumers.values()) consumer.close();
+      session.consumers.clear();
+    });
+    return this.describeWebRtcTransport(transport);
+  }
+
+  async connectBotRecvTransport(roomId: string, recordingId: string, transportId: string, dtlsParameters: unknown): Promise<void> {
+    const transport = this.requireBotTransport(roomId, recordingId, transportId);
+    await transport.connect({ dtlsParameters: dtlsParameters as DtlsParameters });
+  }
+
+  async consumeForBot(
+    roomId: string,
+    recordingId: string,
+    transportId: string,
+    producerId: string,
+    rtpCapabilities: unknown,
+  ): Promise<{ id: string; producerId: string; kind: MediaKind; rtpParameters: RtpParameters; paused: boolean }> {
+    const room = await this.ensureRoom(roomId);
+    const session = room.botSessions.get(recordingId);
+    const transport = this.requireBotTransport(roomId, recordingId, transportId);
+    const existing = session?.consumers.get(producerId);
+    if (existing && !existing.closed) {
+      return { id: existing.id, producerId, kind: existing.kind, rtpParameters: existing.rtpParameters, paused: existing.paused };
+    }
+    const producer = room.producers.get(producerId)?.producer;
+    if (!producer) throw new SignalingError("PRODUCER_NOT_FOUND", "Producer not found");
+    if (!room.router.canConsume({ producerId, rtpCapabilities: rtpCapabilities as RtpCapabilities })) {
+      throw new SignalingError("MEDIASOUP_ERROR", "Bot cannot consume producer");
+    }
+    if (!session) throw new SignalingError("TRANSPORT_NOT_FOUND", "Bot receive transport not found");
+    const existingPromise = session.consumerPromises.get(producerId);
+    const pending = existingPromise ?? transport.consume({
+      producerId,
+      rtpCapabilities: rtpCapabilities as RtpCapabilities,
+      paused: true,
+    });
+    if (!existingPromise) session.consumerPromises.set(producerId, pending);
+    let consumer: Consumer;
+    try {
+      consumer = await pending;
+    } finally {
+      if (session.consumerPromises.get(producerId) === pending) session.consumerPromises.delete(producerId);
+    }
+    if (room.botSessions.get(recordingId) !== session) {
+      consumer.close();
+      throw new SignalingError("TRANSPORT_NOT_FOUND", "Bot session was closed");
+    }
+    const installed = session.consumers.get(producerId);
+    if (installed === consumer) {
+      return { id: consumer.id, producerId, kind: consumer.kind, rtpParameters: consumer.rtpParameters, paused: consumer.paused };
+    }
+    session.consumers.set(producerId, consumer);
+    consumer.observer.once("close", () => {
+      if (session.consumers.get(producerId) === consumer) session.consumers.delete(producerId);
+    });
+    return { id: consumer.id, producerId, kind: consumer.kind, rtpParameters: consumer.rtpParameters, paused: consumer.paused };
+  }
+
+  async setBotConsumerPaused(roomId: string, recordingId: string, producerId: string, paused: boolean): Promise<void> {
+    const consumer = this.rooms.get(roomId)?.botSessions.get(recordingId)?.consumers.get(producerId);
+    if (!consumer || consumer.closed || consumer.paused === paused) return;
+    if (paused) await consumer.pause();
+    else await consumer.resume();
+  }
+
+  closeBotConsumer(roomId: string, recordingId: string, producerId: string): void {
+    const session = this.rooms.get(roomId)?.botSessions.get(recordingId);
+    const consumer = session?.consumers.get(producerId);
+    if (!consumer) return;
+    consumer.close();
+    session?.consumers.delete(producerId);
+  }
+
+  closeBotSession(roomId: string, recordingId: string): void {
+    const room = this.rooms.get(roomId);
+    const session = room?.botSessions.get(recordingId);
+    if (!room || !session) return;
+    for (const consumer of session.consumers.values()) consumer.close();
+    session.consumers.clear();
+    void session.transportPromise?.then((transport) => transport.close()).catch(() => {});
+    for (const pending of session.consumerPromises.values()) {
+      void pending.then((consumer) => consumer.close()).catch(() => {});
+    }
+    session.consumerPromises.clear();
+    session.transport?.close();
+    room.botSessions.delete(recordingId);
+  }
+
   async closeProducer(
     roomId: string,
     participantId: string,
@@ -494,6 +626,7 @@ export class MediasoupService {
     participantId: string;
     kind: MediaKind;
     source: "mic" | "camera" | "screen";
+    paused: boolean;
   }> {
     const room = this.rooms.get(roomId);
     if (!room) {
@@ -505,6 +638,7 @@ export class MediasoupService {
       participantId: record.participantId,
       kind: record.producer.kind,
       source: record.source,
+      paused: record.producer.paused,
     }));
   }
 
@@ -613,6 +747,24 @@ export class MediasoupService {
     return this.getUsableWorkerCount() > 0;
   }
 
+  private requireBotTransport(roomId: string, recordingId: string, transportId: string): WebRtcTransport {
+    const transport = this.rooms.get(roomId)?.botSessions.get(recordingId)?.transport;
+    if (!transport || transport.closed || transport.id !== transportId) {
+      throw new SignalingError("TRANSPORT_NOT_FOUND", "Bot receive transport not found");
+    }
+    return transport;
+  }
+
+  private describeWebRtcTransport(transport: WebRtcTransport): CreateWebRtcTransportResponseData {
+    return {
+      id: transport.id,
+      iceParameters: transport.iceParameters as CreateWebRtcTransportResponseData["iceParameters"],
+      iceCandidates: transport.iceCandidates as CreateWebRtcTransportResponseData["iceCandidates"],
+      dtlsParameters: transport.dtlsParameters as CreateWebRtcTransportResponseData["dtlsParameters"],
+      iceServers: this.config.iceServers.length > 0 ? this.config.iceServers : undefined,
+    };
+  }
+
   private async getTransport(
     roomId: string,
     participantId: string,
@@ -719,8 +871,8 @@ export class MediasoupService {
         rtcMinPort: this.config.rtcMinPort,
         rtcMaxPort: this.config.rtcMaxPort,
       });
-      worker.on("died", () => {
-        void this.handleWorkerDeath(index, worker);
+      worker.on("died", (error) => {
+        void this.handleWorkerDeath(index, worker, error);
       });
       this.workers[index] = worker;
     } catch (error) {
@@ -735,7 +887,7 @@ export class MediasoupService {
     }
   }
 
-  private async handleWorkerDeath(index: number, worker: Worker): Promise<void> {
+  private async handleWorkerDeath(index: number, worker: Worker, error: Error): Promise<void> {
     if (this.closing || this.workers[index] !== worker) {
       return;
     }
@@ -744,6 +896,7 @@ export class MediasoupService {
       operation: "mediasoup.worker.died",
       errorCode: "MEDIASOUP_WORKER_DIED",
       workerIndex: index,
+      error: String(error),
     });
     this.workers[index] = undefined;
     for (const [roomId, room] of [...this.rooms.entries()]) {

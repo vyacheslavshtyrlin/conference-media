@@ -95,6 +95,7 @@ export const createIntegrationRoomRequestSchema = z.object({
   externalRoomId: z.string().trim().min(1).max(128),
   title: z.string().trim().max(160).optional(),
   accessPolicy: z.literal("approval"),
+  recordingRequested: z.boolean().optional().default(false),
   initialUser: z
     .object({
       id: z.string().trim().min(1).max(160),
@@ -111,9 +112,38 @@ export const createIntegrationRoomResponseSchema = z.object({
   expiresAt: roomExpiresAtSchema,
   status: roomStatusSchema,
   accessPolicy: z.literal("approval"),
+  recordingId: z.string().min(1).nullable(),
   entryUrl: z.string().url().optional(),
   entryExpiresAt: z.string().datetime().optional(),
 });
+
+export const recordingStatusSchema = z.enum([
+  "requested",
+  "capturing",
+  "finalizing",
+  "ready",
+  "failed",
+  "cancelled",
+  "deleted",
+]);
+
+export const recordingProjectionSchema = z.object({
+  recordingId: z.string().min(1),
+  status: recordingStatusSchema,
+}).strict();
+
+export const recordingControlProjectionSchema = z.object({
+  integrationId: z.string().min(1),
+  recordingId: z.string().min(1),
+  requestedAt: z.string().datetime(),
+  status: recordingStatusSchema,
+}).strict();
+
+export const recordingBotAdmissionResponseSchema = z.object({
+  protocolVersion: z.literal("recording-bot.v1"),
+  admission: z.string().min(1),
+  expiresAt: z.string().datetime(),
+}).strict();
 
 export const integrationAdmissionIdentitySchema = z.object({
   kind: z.enum(["guest", "authenticated"]),
@@ -222,6 +252,10 @@ export type RoomSessionRefreshRequest = z.infer<typeof roomSessionRefreshRequest
 export type RoomSessionRefreshResponse = z.infer<typeof roomSessionRefreshResponseSchema>;
 export type CreateIntegrationRoomRequest = z.infer<typeof createIntegrationRoomRequestSchema>;
 export type CreateIntegrationRoomResponse = z.infer<typeof createIntegrationRoomResponseSchema>;
+export type RecordingStatus = z.infer<typeof recordingStatusSchema>;
+export type RecordingProjection = z.infer<typeof recordingProjectionSchema>;
+export type RecordingControlProjection = z.infer<typeof recordingControlProjectionSchema>;
+export type RecordingBotAdmissionResponse = z.infer<typeof recordingBotAdmissionResponseSchema>;
 export type IntegrationAdmissionIdentity = z.infer<typeof integrationAdmissionIdentitySchema>;
 export type CreateIntegrationAdmissionRequest = z.infer<typeof createIntegrationAdmissionRequestSchema>;
 export type CreateIntegrationAdmissionResponse = z.infer<typeof createIntegrationAdmissionResponseSchema>;

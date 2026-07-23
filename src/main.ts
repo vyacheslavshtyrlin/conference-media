@@ -11,8 +11,13 @@ import { createSignalingHttpHandler } from "./httpEndpoints.js";
 import { RedisRoomRepository } from "./redisRoomRepository.js";
 import { RedisReadinessProbe } from "./readiness.js";
 import { RoomManager } from "./roomManager.js";
+import { createRecordingBridge } from "./recordingBridge.js";
+import { RecordingBotSessionManager, RecordingBotSocketGateway } from "./recordingBot.js";
 import { SocketGateway } from "./socketGateway.js";
+import { createRoomHistoryBridge } from "./roomHistoryBridge.js";
 import { runBoundedShutdown } from "./shutdown.js";
+import { verifyAndConsumeRecordingBotAdmission } from "./token.js";
+import { attachWebSocketUpgradeRouter } from "./webSocketUpgradeRouter.js";
 
 const config = readSignalingConfig();
 const logger = createLogger("signaling");
@@ -40,7 +45,11 @@ const mediaLease = new MediaInstanceLease(
   logger,
 );
 await mediaLease.acquire();
-const mediasoup = new MediasoupService(config.mediasoup, logger, metrics);
+const mediasoup = new MediasoupService(
+  config.mediasoup,
+  logger,
+  metrics,
+);
 try {
   await mediasoup.init();
 } catch (error) {
@@ -49,6 +58,10 @@ try {
   await redis.quit();
   throw error;
 }
+const recordingBridge = createRecordingBridge(mediasoup, config.recording, logger);
+await recordingBridge?.start();
+const roomHistory = createRoomHistoryBridge(redis, config.recording);
+roomHistory?.start();
 const roomManager = new RoomManager(
   repository,
   mediasoup,
@@ -57,7 +70,27 @@ const roomManager = new RoomManager(
   () => mediaLease.getEpoch(),
   () => mediaLease.isHealthy(),
   metrics,
+  recordingBridge,
+  undefined,
+  roomHistory,
 );
+const recordingBots = new RecordingBotSessionManager(
+  mediasoup,
+  (roomId, accept) => roomManager.freezeBotAuthoritySnapshot(roomId, accept),
+  ({ roomId, recordingId, code }) => {
+    logger.warn("recording bot capture requires recovery", {
+      operation: "recordingBot.recover",
+      errorCode: code,
+      roomId,
+      recordingId,
+      outcome: "failure",
+    });
+    void recordingBridge?.recoverRecording(recordingId).catch((error: unknown) => {
+      recordingBridge.logFailure("recording.botRecovery", roomId, error);
+    });
+  },
+);
+roomManager.setRecordingBotSessionManager(recordingBots);
 
 const server = createServer(createSignalingHttpHandler({
   isRedisReady: () => redisReadiness.check(),
@@ -68,13 +101,28 @@ const server = createServer(createSignalingHttpHandler({
 }));
 
 const wsServer = new WebSocketServer({
-  server,
-  path: "/ws",
+  noServer: true,
   maxPayload: config.websocket.maxPayloadBytes,
 });
 const gateway = new SocketGateway(wsServer, roomManager, config.joinTokenSecret, logger, config.websocket, metrics);
+const botWsServer = config.recordingBotAdmission
+  ? new WebSocketServer({ noServer: true, maxPayload: config.websocket.maxPayloadBytes })
+  : undefined;
+const botGateway = botWsServer && config.recordingBotAdmission
+  ? new RecordingBotSocketGateway(
+      botWsServer,
+      recordingBots,
+      (token) => verifyAndConsumeRecordingBotAdmission(token, config.recordingBotAdmission!, redis),
+      logger,
+    )
+  : undefined;
+
+const webSocketRoutes = new Map([["/ws", wsServer]]);
+if (botWsServer) webSocketRoutes.set("/internal/recording-bot/v1", botWsServer);
+attachWebSocketUpgradeRouter(server, webSocketRoutes);
 
 gateway.start();
+botGateway?.start();
 
 server.listen(config.port, "0.0.0.0", () => {
   logger.info("signaling service started", { operation: "service.start", port: config.port });
@@ -94,6 +142,12 @@ function renderMetrics(): string {
     transports: mediaStats.transports,
     producers: mediaStats.producers,
     consumers: mediaStats.consumers,
+    recordingWorkerSlots: recordingBridge ? {
+      total: recordingBridge.getWorkerPoolSnapshot().totalSlots,
+      available: recordingBridge.getWorkerPoolSnapshot().availableSlots,
+      occupied: recordingBridge.getWorkerPoolSnapshot().occupiedSlots,
+      healthyWorkers: recordingBridge.getWorkerPoolSnapshot().healthyWorkers,
+    } : undefined,
   });
 }
 
@@ -119,10 +173,12 @@ async function runShutdown(reason: string): Promise<void> {
   await runBoundedShutdown(
     async () => {
         await gateway.stop();
+        await botGateway?.stop();
         await roomManager.shutdown();
+        recordingBridge?.stop();
         mediasoup.closeAll();
         await mediaLease.release();
-        await closeWebSocketServer();
+        await closeWebSocketServers();
         await closeHttpServer();
         if (redis.isOpen) {
           await redis.quit();
@@ -158,17 +214,12 @@ process.on("SIGTERM", () => {
 });
 
 
-function closeWebSocketServer(): Promise<void> {
-  return new Promise((resolve, reject) => {
-    wsServer.close((error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-
-      resolve();
-    });
-  });
+function closeWebSocketServers(): Promise<void> {
+  return Promise.all([wsServer, botWsServer].filter((value): value is WebSocketServer => Boolean(value)).map((webSocketServer) =>
+    new Promise<void>((resolve, reject) => {
+      webSocketServer.close((error) => error ? reject(error) : resolve());
+    }),
+  )).then(() => undefined);
 }
 
 function closeHttpServer(): Promise<void> {

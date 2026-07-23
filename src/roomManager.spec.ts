@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { MediasoupService } from "./mediasoupService.js";
 import type { RedisRoomRepository } from "./redisRoomRepository.js";
+import type { RoomRecordingBridge } from "./recordingBridge.js";
+import { RecordingBotSessionManager } from "./recordingBot.js";
 import { RoomManager } from "./roomManager.js";
 import type { JoinTokenPayload } from "./token.js";
 
@@ -127,6 +129,15 @@ class FakeMediasoupService {
     this.closeRoomCalls += 1;
   }
 
+  listProducers(): Array<{ producerId: string; participantId: string; kind: "audio" | "video"; source: "mic" | "camera" | "screen" }> {
+    return Array.from(this.producers.entries()).map(([producerId, producer]) => ({
+      producerId,
+      participantId: producer.participantId,
+      kind: producer.source === "mic" ? "audio" : "video",
+      source: producer.source,
+    }));
+  }
+
   closePeer(_roomId: string, participantId: string): string[] {
     this.closePeerCalls += 1;
     const closed = Array.from(this.producers.entries())
@@ -242,6 +253,125 @@ function createCreatorPayload(participantId: string): JoinTokenPayload {
 }
 
 describe("RoomManager", () => {
+  it("does not persist the first human while recording capacity is exhausted and permits a later admitted retry", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const roomBecameLive = vi.fn()
+      .mockRejectedValueOnce(new Error("Recording capacity is temporarily unavailable"))
+      .mockRejectedValueOnce(new Error("Recording capacity is temporarily unavailable"))
+      .mockResolvedValue(undefined);
+    const recording: RoomRecordingBridge = {
+      roomBecameLive,
+      producerAdded: vi.fn().mockResolvedValue(undefined),
+      producerPaused: vi.fn().mockResolvedValue(undefined),
+      producerClosed: vi.fn().mockResolvedValue(undefined),
+      stopRoom: vi.fn().mockResolvedValue(undefined),
+      logFailure: vi.fn(),
+    };
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      recording,
+    );
+
+    await expect(manager.join(createPayload("peer_1"))).rejects.toMatchObject({
+      message: "Recording capacity is temporarily unavailable",
+    });
+    await expect(manager.join(createPayload("peer_1"))).rejects.toMatchObject({
+      message: "Recording capacity is temporarily unavailable",
+    });
+    expect(repository.participants.size).toBe(0);
+    expect(mediasoup.ensureRoomCalls).toBe(0);
+
+    await expect(manager.join(createPayload("peer_1"))).resolves.toMatchObject({
+      participant: { participantId: "peer_1" },
+    });
+    expect(repository.participants.has("peer_1")).toBe(true);
+    expect(roomBecameLive).toHaveBeenCalledTimes(3);
+  });
+
+  it("installs the local bot room fence before awaiting a rejected or unresolved close-input dispatch", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService() as FakeMediasoupService & { closeBotSession: ReturnType<typeof vi.fn> };
+    mediasoup.closeBotSession = vi.fn();
+    let rejectStop!: (error: Error) => void;
+    const stopPending = new Promise<void>((_resolve, reject) => { rejectStop = reject; });
+    const recording: RoomRecordingBridge = {
+      roomBecameLive: vi.fn().mockResolvedValue(undefined),
+      producerAdded: vi.fn().mockResolvedValue(undefined),
+      producerPaused: vi.fn().mockResolvedValue(undefined),
+      producerClosed: vi.fn().mockResolvedValue(undefined),
+      stopRoom: vi.fn(() => stopPending),
+      logFailure: vi.fn(),
+    };
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      recording,
+    );
+    const bots = new RecordingBotSessionManager(
+      mediasoup as unknown as MediasoupService,
+      (roomId, accept) => manager.freezeBotAuthoritySnapshot(roomId, accept),
+    );
+    manager.setRecordingBotSessionManager(bots);
+    await manager.join(createPayload("peer_1"));
+    bots.open({
+      sub: "recording-bot",
+      aud: "conference-recording-bot-signaling",
+      iss: "conference-api",
+      roomId: room.roomId,
+      recordingId: "rec_1",
+      mediaNodeId: "local",
+      jti: "jti_1",
+      iat: 1,
+      exp: 2,
+    }, () => {});
+
+    const leave = manager.leave(room.roomId, "peer_1");
+    await vi.waitFor(() => expect(recording.stopRoom).toHaveBeenCalledWith(room.roomId));
+    expect(() => bots.open({
+      sub: "recording-bot",
+      aud: "conference-recording-bot-signaling",
+      iss: "conference-api",
+      roomId: room.roomId,
+      recordingId: "rec_stale",
+      mediaNodeId: "local",
+      jti: "jti_stale",
+      iat: 1,
+      exp: 2,
+    }, () => {})).toThrow("BOT_CAPTURE_INCOMPLETE");
+
+    rejectStop(new Error("close-inputs unavailable"));
+    await expect(leave).resolves.toMatchObject({ participant: expect.objectContaining({ participantId: "peer_1" }) });
+    expect(recording.logFailure).toHaveBeenCalledWith("recording.stop", room.roomId, expect.any(Error));
+    expect(mediasoup.closeRoomCalls).toBe(0);
+  });
+
+  it("freezes bot authority only after an in-flight room mutation and its revision hook complete", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const manager = new RoomManager(repository as unknown as RedisRoomRepository, mediasoup as unknown as MediasoupService, 60_000);
+    let frozen: unknown;
+
+    const join = manager.join(createPayload("peer_1"));
+    const snapshot = manager.freezeBotAuthoritySnapshot(room.roomId, (value) => {
+      frozen = value;
+    });
+    await Promise.all([join, snapshot]);
+
+    expect(frozen).toEqual({ participants: [{ participantId: "peer_1", displayName: "peer_1" }], producers: [] });
+  });
+
   it("persists producer-backed media through create, pause, resume and close", async () => {
     const repository = new FakeRepository();
     const mediasoup = new FakeMediasoupService();
@@ -473,6 +603,44 @@ describe("RoomManager", () => {
     expect(manager.getRuntimeStats()).toEqual({ activeRooms: 0, activeParticipants: 0 });
   });
 
+  it("blocks retry after participant persistence fails following successful recording preparation", async () => {
+    const repository = new FakeRepository();
+    repository.failSaveParticipant = true;
+    const mediasoup = new FakeMediasoupService();
+    let blockedPreLive = false;
+    const recording: RoomRecordingBridge = {
+      roomBecameLive: vi.fn(async () => {
+        if (blockedPreLive) throw new Error("Recording preparation was aborted before the first participant became live");
+      }),
+      producerAdded: vi.fn().mockResolvedValue(undefined),
+      producerPaused: vi.fn().mockResolvedValue(undefined),
+      producerClosed: vi.fn().mockResolvedValue(undefined),
+      stopRoom: vi.fn().mockResolvedValue(undefined),
+      abortPrepared: vi.fn(async () => {
+        blockedPreLive = true;
+      }),
+      logFailure: vi.fn(),
+    };
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      recording,
+    );
+
+    await expect(manager.join(createPayload("peer_1"))).rejects.toThrow("redis save participant failed");
+    repository.failSaveParticipant = false;
+    await expect(manager.join(createPayload("peer_1"))).rejects.toThrow("Recording capacity is temporarily unavailable");
+
+    expect(recording.abortPrepared).toHaveBeenCalledTimes(1);
+    expect(repository.participants.size).toBe(0);
+    expect(mediasoup.ensureRoomCalls).toBe(0);
+  });
+
   it("rejects joins while the media lease is unhealthy without creating runtime participants", async () => {
     const repository = new FakeRepository();
     const mediasoup = new FakeMediasoupService();
@@ -555,6 +723,46 @@ describe("RoomManager", () => {
     expect(mediasoup.closePeerCalls).toBe(2);
     expect(mediasoup.closeRoomCalls).toBe(1);
     expect(manager.getRuntimeStats()).toEqual({ activeRooms: 0, activeParticipants: 0 });
+  });
+
+  it("awaits bounded recording stop dispatch before completing shutdown", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    let releaseStop: (() => void) | undefined;
+    const stopDispatch = new Promise<void>((resolve) => {
+      releaseStop = resolve;
+    });
+    const recording: RoomRecordingBridge = {
+      roomBecameLive: async () => {},
+      producerAdded: async () => {},
+      producerPaused: async () => {},
+      producerClosed: async () => {},
+      stopRoom: vi.fn(async () => stopDispatch),
+      logFailure: vi.fn(),
+    };
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      recording,
+    );
+    await manager.join(createPayload("peer_1"));
+
+    let completed = false;
+    const shutdown = manager.shutdown().then(() => {
+      completed = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(recording.stopRoom).toHaveBeenCalledWith(room.roomId);
+    expect(completed).toBe(false);
+    releaseStop?.();
+    await shutdown;
+    expect(completed).toBe(true);
   });
 
   it("does not extend retention or repeat cleanup on duplicate leave", async () => {

@@ -19,6 +19,12 @@ export type MediaRuntimeSnapshot = {
   transports: number;
   producers: number;
   consumers: number;
+  recordingWorkerSlots?: {
+    total: number;
+    available: number;
+    occupied: number;
+    healthyWorkers: number;
+  };
 };
 
 const forbiddenLabelNames = new Set([
@@ -146,6 +152,18 @@ export class MediaMetrics {
       "# HELP mediasoup_consumers Active mediasoup consumers.",
       "# TYPE mediasoup_consumers gauge",
       `mediasoup_consumers ${snapshot.consumers}`,
+      "# HELP recording_worker_slots_total Total recording slots on healthy workers.",
+      "# TYPE recording_worker_slots_total gauge",
+      `recording_worker_slots_total ${snapshot.recordingWorkerSlots?.total ?? 0}`,
+      "# HELP recording_worker_slots_available Available recording slots on healthy workers.",
+      "# TYPE recording_worker_slots_available gauge",
+      `recording_worker_slots_available ${snapshot.recordingWorkerSlots?.available ?? 0}`,
+      "# HELP recording_worker_slots_occupied Occupied recording slots on healthy workers.",
+      "# TYPE recording_worker_slots_occupied gauge",
+      `recording_worker_slots_occupied ${snapshot.recordingWorkerSlots?.occupied ?? 0}`,
+      "# HELP recording_workers_healthy Recording workers with a current lease.",
+      "# TYPE recording_workers_healthy gauge",
+      `recording_workers_healthy ${snapshot.recordingWorkerSlots?.healthyWorkers ?? 0}`,
       "# HELP signaling_websocket_connects_total Total WebSocket connection attempts.",
       "# TYPE signaling_websocket_connects_total counter",
       ...this.renderCounters("signaling_websocket_connects_total"),

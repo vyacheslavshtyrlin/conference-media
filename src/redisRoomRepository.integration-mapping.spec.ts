@@ -42,6 +42,7 @@ function seedIntegrationOwner(redis: FakeRedis) {
       integrationId: "crm-alpha",
       externalRoomHash: "external_hash",
       requestHash: "request_hash",
+      recordingId: "rec_1",
       createdAt: room.createdAt,
     }),
   );
@@ -57,6 +58,9 @@ describe("RedisRoomRepository integration mappings", () => {
     expect(redis.persisted).toEqual(expect.arrayContaining([
       "integration_room_owner:room_1",
       "integration_room:crm-alpha:external_hash",
+      "integration_recording:rec_1",
+      "recording_activation:rec_1",
+      "recording_finalizing:rec_1",
     ]));
 
     await repository.markRoomEmpty(room);
@@ -64,6 +68,9 @@ describe("RedisRoomRepository integration mappings", () => {
     expect(redis.expired).toEqual(expect.arrayContaining([
       "integration_room_owner:room_1",
       "integration_room:crm-alpha:external_hash",
+      "integration_recording:rec_1",
+      "recording_activation:rec_1",
+      "recording_finalizing:rec_1",
     ]));
   });
 
