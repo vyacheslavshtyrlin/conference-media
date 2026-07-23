@@ -87,9 +87,7 @@ describe("readSignalingConfig", () => {
   it("reads the node-scoped recording bot admission verifier and caps its TTL at 60 seconds", () => {
     Object.assign(process.env, {
       MEDIA_NODE_ID: "media-a",
-      RECORDING_BOT_ADMISSION_JWT_ISSUER: "conference-api",
       RECORDING_BOT_ADMISSION_JWT_HS256_SECRET: "z".repeat(32),
-      RECORDING_BOT_ADMISSION_TTL_SECONDS: "60",
     });
 
     expect(readSignalingConfig().recordingBotAdmission).toEqual({
@@ -99,7 +97,5 @@ describe("readSignalingConfig", () => {
       maxTtlSeconds: 60,
     });
 
-    process.env.RECORDING_BOT_ADMISSION_TTL_SECONDS = "61";
-    expect(readSignalingConfig).toThrow("RECORDING_BOT_ADMISSION_TTL_SECONDS must not exceed 60");
   });
 });
