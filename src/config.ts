@@ -136,16 +136,12 @@ export function readSignalingConfig(): SignalingConfig {
 }
 
 function readRecordingBotAdmissionConfig(mediaNodeId: string): SignalingConfig["recordingBotAdmission"] {
-  const issuer = process.env.RECORDING_BOT_ADMISSION_JWT_ISSUER?.trim();
   const secret = process.env.RECORDING_BOT_ADMISSION_JWT_HS256_SECRET?.trim();
-  if (!issuer && !secret) return undefined;
-  if (!issuer || !secret) throw new Error("Recording bot admission configuration is incomplete");
+  if (!secret) return undefined;
   if (Buffer.byteLength(secret, "utf8") < 32) {
     throw new Error("RECORDING_BOT_ADMISSION_JWT_HS256_SECRET must contain at least 32 bytes");
   }
-  const maxTtlSeconds = readPositiveNumberEnv("RECORDING_BOT_ADMISSION_TTL_SECONDS", 60);
-  if (maxTtlSeconds > 60) throw new Error("RECORDING_BOT_ADMISSION_TTL_SECONDS must not exceed 60");
-  return { issuer, secret, mediaNodeId, maxTtlSeconds };
+  return { issuer: "conference-api", secret, mediaNodeId, maxTtlSeconds: 60 };
 }
 
 export function validateSignalingConfig(config: SignalingConfig): void {
@@ -175,8 +171,6 @@ export function validateSignalingConfig(config: SignalingConfig): void {
 function readRecordingConfig(): SignalingConfig["recording"] {
   const required = [
     "RECORDING_CONTROL_URL",
-    "RECORDING_CONTROL_JWT_ISSUER",
-    "RECORDING_CONTROL_JWT_AUDIENCE",
     "RECORDING_CONTROL_JWT_HS256_SECRET",
     "RECORDING_BOT_WORKERS_JSON",
     "RECORDING_BOT_SIGNALING_URL",
@@ -255,10 +249,10 @@ function readServiceJwt(prefix: "RECORDING_CONTROL_JWT" | "RECORDING_BOT_CONTROL
   }
 
   return {
-    issuer: readEnv(`${prefix}_ISSUER`),
-    audience: readEnv(`${prefix}_AUDIENCE`),
+    issuer: "conference-signaling",
+    audience: "conference-recording-control",
     secret,
-    maxTtlSeconds: readPositiveNumberEnv(`${prefix}_MAX_TTL_SECONDS`, 300),
+    maxTtlSeconds: 300,
   };
 }
 function readPrivateWebSocketUrl(name: string): string {
