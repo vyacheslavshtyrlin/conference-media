@@ -45,7 +45,8 @@ WebSocket: heartbeat, max payload, backpressure, rate limit, проверка or
 | `RECORDING_CONTROL_URL` | Private API URL с суффиксом `/internal/v1` для control plane записи. |
 | `RECORDING_CONTROL_JWT_HS256_SECRET` | Общий с API секрет signaling → API внутренних recording events. |
 | `RECORDING_BOT_ADMISSION_JWT_HS256_SECRET` | Общий с API секрет выдачи короткоживущих admission для receive-only capture bot. |
-| `RECORDING_BOT_WORKERS_JSON` | JSON-массив capture worker-ов: `workerId`, private `controlUrl`, `capacity`. Для одного хоста: `http://recording-bot:8090`. |
+| `RECORDING_BOT_WORKERS_JSON` | JSON-массив capture worker-ов: `workerId`, `controlUrl`, `capacity`. Production registry содержит `recording-worker-1` … `recording-worker-5` с портами `8091` … `8095` и capacity `10` у каждого. |
+| `RECORDING_BOT_SIGNALING_URL` | WebSocket URL signaling для приватного capture worker: `wss://media.victoryspace.ru/internal/recording-bot/v1`. |
 | `RECORDING_WORKER_LEASE_TTL_MS` / `RECORDING_WORKER_HEARTBEAT_MS` | Lease и heartbeat capacity admission; heartbeat должен быть меньше lease TTL. |
 | `ROOM_EMPTY_GRACE_MS` | Задержка очистки пустой комнаты (по умолчанию `10000`). |
 | `MEDIA_LEASE_TTL_MS` / `MEDIA_LEASE_REFRESH_MS` | TTL и refresh интервал single-node media lease (`15000` / `5000` ms); lease связывает Redis live participants с текущим signaling process. |
