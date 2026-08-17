@@ -92,7 +92,7 @@ export class RoomManager {
 
       const alreadyJoined = Boolean(state.peers.getPeer(payload.participantId));
       const isFirstHuman = state.peers.count() === 0 && !alreadyJoined;
-      if (isFirstHuman && this.recording) {
+      if (isFirstHuman && metadata.recordingRequested && this.recording) {
         try {
           await this.recording.roomBecameLive(
             metadata,
@@ -254,7 +254,9 @@ export class RoomManager {
         rtpParameters,
         source,
         (producerId) => {
-          this.runRecording("recording.producerClosed", roomId, () => this.recording?.producerClosed(roomId, producerId));
+            if (state.metadata.recordingRequested) {
+              this.runRecording("recording.producerClosed", roomId, () => this.recording?.producerClosed(roomId, producerId));
+            }
           void this.runExclusive(roomId, async () => {
             const runtime = this.rooms.get(roomId);
             if (!runtime) return;
@@ -282,7 +284,9 @@ export class RoomManager {
         kind,
         source,
       };
-      this.runRecording("recording.producerAdded", roomId, () => this.recording?.producerAdded(state.metadata, reconciled.participant, producer));
+      if (state.metadata.recordingRequested) {
+        this.runRecording("recording.producerAdded", roomId, () => this.recording?.producerAdded(state.metadata, reconciled.participant, producer));
+      }
       this.syncBotAuthority(roomId);
       return { ...data, participant: reconciled.participant };
     });

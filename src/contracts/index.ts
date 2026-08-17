@@ -666,6 +666,8 @@ export const roomMetadataSchema = z.object({
   status: roomStatusSchema,
   closedReason: roomClosedReasonValueSchema.optional().default(null),
   accessPolicy: roomAccessPolicySchema.default("link"),
+  // Internal Redis metadata. It is never included in public REST or WebSocket payloads.
+  recordingRequested: z.boolean().optional().default(false),
 });
 
 export type RoomMetadata = z.infer<typeof roomMetadataSchema>;

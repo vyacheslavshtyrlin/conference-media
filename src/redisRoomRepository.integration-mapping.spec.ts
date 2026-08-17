@@ -12,6 +12,7 @@ const room: RoomMetadata = {
   status: "active",
   closedReason: null,
   accessPolicy: "approval",
+  recordingRequested: false,
 };
 
 class FakeRedis implements RedisClient {

@@ -14,6 +14,7 @@ const room: RoomMetadata = {
   status: "active",
   closedReason: null,
   accessPolicy: "approval",
+  recordingRequested: true,
 };
 
 const participant: Participant = {

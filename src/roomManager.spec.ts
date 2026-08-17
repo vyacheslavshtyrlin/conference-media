@@ -18,6 +18,7 @@ const room: RoomMetadata = {
   status: "active",
   closedReason: null,
   accessPolicy: "link",
+  recordingRequested: false,
 };
 
 class FakeRepository {
@@ -253,8 +254,39 @@ function createCreatorPayload(participantId: string): JoinTokenPayload {
 }
 
 describe("RoomManager", () => {
+  it("admits a public room without consulting recording control when that service is unavailable", async () => {
+    const repository = new FakeRepository();
+    const mediasoup = new FakeMediasoupService();
+    const recording: RoomRecordingBridge = {
+      roomBecameLive: vi.fn().mockRejectedValue(new Error("recording control unavailable")),
+      producerAdded: vi.fn().mockRejectedValue(new Error("recording control unavailable")),
+      producerPaused: vi.fn().mockResolvedValue(undefined),
+      producerClosed: vi.fn().mockResolvedValue(undefined),
+      stopRoom: vi.fn().mockResolvedValue(undefined),
+      logFailure: vi.fn(),
+    };
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      recording,
+    );
+
+    await expect(manager.join(createPayload("peer_1"))).resolves.toMatchObject({
+      participant: { participantId: "peer_1" },
+    });
+
+    expect(recording.roomBecameLive).not.toHaveBeenCalled();
+    expect(recording.producerAdded).not.toHaveBeenCalled();
+  });
+
   it("does not persist the first human while recording capacity is exhausted and permits a later admitted retry", async () => {
     const repository = new FakeRepository();
+    repository.room = { ...room, recordingRequested: true };
     const mediasoup = new FakeMediasoupService();
     const roomBecameLive = vi.fn()
       .mockRejectedValueOnce(new Error("Recording capacity is temporarily unavailable"))
@@ -605,6 +637,7 @@ describe("RoomManager", () => {
 
   it("blocks retry after participant persistence fails following successful recording preparation", async () => {
     const repository = new FakeRepository();
+    repository.room = { ...room, recordingRequested: true };
     repository.failSaveParticipant = true;
     const mediasoup = new FakeMediasoupService();
     let blockedPreLive = false;

@@ -29,6 +29,7 @@ const room: RoomMetadata = {
   status: "active",
   closedReason: null,
   accessPolicy: "link",
+  recordingRequested: false,
 };
 
 const logger: Logger = {
