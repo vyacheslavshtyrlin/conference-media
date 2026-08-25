@@ -70,6 +70,16 @@ const mediaCodecs = [
       "x-google-start-bitrate": 1000,
     },
   },
+  {
+    kind: "video" as const,
+    mimeType: "video/H264",
+    clockRate: 90000,
+    parameters: {
+      "packetization-mode": 1,
+      "level-asymmetry-allowed": 1,
+      "profile-level-id": "42e01f",
+    },
+  },
 ];
 
 const ACTIVE_SPEAKER_THRESHOLD_DBOV = -55;

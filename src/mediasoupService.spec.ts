@@ -48,26 +48,33 @@ let fakeTransportConnections: Array<{ ip?: string; port?: number }> = [];
 let fakeRouters: unknown[] = [];
 let fakePreferredLayers: Array<{ spatialLayer: number; temporalLayer?: number }> = [];
 let fakeConsumerPaused: boolean[] = [];
+let fakeRouterMediaCodecs: Array<Array<Record<string, unknown>>> = [];
+let fakeProducedRtpParameters: Array<Record<string, unknown>> = [];
+let fakeConsumedRtpCapabilities: Array<Record<string, unknown>> = [];
+let fakeCanConsume: (rtpCapabilities: Record<string, unknown>) => boolean = () => true;
 let nextFakeProducerType: FakeProducer["type"] = "simple";
 
 function createFakeWorker() {
   const worker = new EventEmitter() as EventEmitter & {
     observer: EventEmitter;
     close: () => void;
-    createRouter: () => Promise<ReturnType<typeof createFakeRouter>>;
+    createRouter: (options: { mediaCodecs: Array<Record<string, unknown>> }) => Promise<ReturnType<typeof createFakeRouter>>;
   };
   worker.observer = new EventEmitter();
   worker.close = () => {
     worker.observer.emit("close");
   };
-  worker.createRouter = async () => createFakeRouter();
+  worker.createRouter = async ({ mediaCodecs }) => {
+    fakeRouterMediaCodecs.push(mediaCodecs);
+    return createFakeRouter(mediaCodecs);
+  };
   return worker;
 }
 
-function createFakeRouter() {
+function createFakeRouter(mediaCodecs: Array<Record<string, unknown>>) {
   const router = {
-    rtpCapabilities: {},
-    canConsume: () => true,
+    rtpCapabilities: { codecs: mediaCodecs },
+    canConsume: ({ rtpCapabilities }: { rtpCapabilities: Record<string, unknown> }) => fakeCanConsume(rtpCapabilities),
     createAudioLevelObserver: async (options: Record<string, unknown>) => {
       fakeAudioLevelObserverOptions.push(options);
       return createFakeAudioLevelObserver();
@@ -101,9 +108,13 @@ function createFakeTransport() {
     connect: async (parameters: { ip?: string; port?: number }) => {
       fakeTransportConnections.push(parameters);
     },
-    produce: async ({ kind }: { kind: "audio" | "video" }) => createFakeProducer(kind),
-    consume: async ({ producerId, paused }: { producerId: string; paused?: boolean }) => {
+    produce: async ({ kind, rtpParameters }: { kind: "audio" | "video"; rtpParameters: Record<string, unknown> }) => {
+      fakeProducedRtpParameters.push(rtpParameters);
+      return createFakeProducer(kind);
+    },
+    consume: async ({ producerId, paused, rtpCapabilities }: { producerId: string; paused?: boolean; rtpCapabilities: Record<string, unknown> }) => {
       fakeConsumerPaused.push(paused ?? false);
+      fakeConsumedRtpCapabilities.push(rtpCapabilities);
       return createFakeConsumer(producerId, paused ?? false);
     },
     close() {
@@ -181,6 +192,10 @@ describe("MediasoupService", () => {
     fakeRouters = [];
     fakePreferredLayers = [];
     fakeConsumerPaused = [];
+    fakeRouterMediaCodecs = [];
+    fakeProducedRtpParameters = [];
+    fakeConsumedRtpCapabilities = [];
+    fakeCanConsume = () => true;
     nextFakeProducerType = "simple";
     createWorker.mockImplementation(async () => createFakeWorker());
   });
@@ -212,6 +227,120 @@ describe("MediasoupService", () => {
       threshold: -55,
       interval: 800,
     });
+  });
+
+  it("advertises VP8 before the constrained-baseline H.264 tuple", async () => {
+    const service = await createService();
+
+    const capabilities = await service.getRouterRtpCapabilities("room_1");
+
+    expect(fakeRouterMediaCodecs[0]).toEqual([
+      expect.objectContaining({ kind: "audio", mimeType: "audio/opus", clockRate: 48000 }),
+      expect.objectContaining({ kind: "video", mimeType: "video/VP8", clockRate: 90000 }),
+      {
+        kind: "video",
+        mimeType: "video/H264",
+        clockRate: 90000,
+        parameters: {
+          "packetization-mode": 1,
+          "level-asymmetry-allowed": 1,
+          "profile-level-id": "42e01f",
+        },
+      },
+    ]);
+    expect(capabilities.codecs?.map((codec) => codec.mimeType)).toEqual([
+      "audio/opus",
+      "video/VP8",
+      "video/H264",
+    ]);
+  });
+
+  it("produces and consumes the supported constrained-baseline H.264 tuple for a bot", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const h264RtpParameters = {
+      codecs: [{
+        mimeType: "video/H264",
+        payloadType: 102,
+        clockRate: 90000,
+        parameters: {
+          "packetization-mode": 1,
+          "level-asymmetry-allowed": 1,
+          "profile-level-id": "42e01f",
+        },
+      }],
+    };
+    const h264Capabilities = {
+      codecs: [{
+        kind: "video",
+        mimeType: "video/H264",
+        preferredPayloadType: 102,
+        clockRate: 90000,
+        parameters: {
+          "packetization-mode": 1,
+          "level-asymmetry-allowed": 1,
+          "profile-level-id": "42e01f",
+        },
+      }],
+    };
+    fakeCanConsume = (capabilities) => capabilities === h264Capabilities;
+    const producer = await service.produce(
+      "room_1",
+      "peer_1",
+      sendTransport.id,
+      "video",
+      h264RtpParameters,
+      "camera",
+      () => {},
+    );
+    const botTransport = await service.createBotRecvTransport("room_1", "rec_1");
+
+    await expect(
+      service.consumeForBot("room_1", "rec_1", botTransport.id, producer.id, h264Capabilities),
+    ).resolves.toMatchObject({ producerId: producer.id, paused: true });
+    expect(fakeProducedRtpParameters).toEqual([h264RtpParameters]);
+    expect(fakeConsumedRtpCapabilities).toEqual([h264Capabilities]);
+  });
+
+  it("keeps VP8 consumption available and explicitly rejects an unsupported H.264 tuple", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const vp8RtpParameters = {
+      codecs: [{ mimeType: "video/VP8", payloadType: 96, clockRate: 90000 }],
+    };
+    const vp8Capabilities = {
+      codecs: [{ kind: "video", mimeType: "video/VP8", preferredPayloadType: 96, clockRate: 90000 }],
+    };
+    const unsupportedH264Capabilities = {
+      codecs: [{
+        kind: "video",
+        mimeType: "video/H264",
+        preferredPayloadType: 102,
+        clockRate: 90000,
+        parameters: { "packetization-mode": 0, "profile-level-id": "64001f" },
+      }],
+    };
+    fakeCanConsume = (capabilities) => capabilities === vp8Capabilities;
+    const producer = await service.produce(
+      "room_1",
+      "peer_1",
+      sendTransport.id,
+      "video",
+      vp8RtpParameters,
+      "camera",
+      () => {},
+    );
+
+    await expect(
+      service.consume("room_1", "peer_2", recvTransport.id, producer.id, vp8Capabilities),
+    ).resolves.toMatchObject({ producerId: producer.id });
+    expect(fakeProducedRtpParameters).toEqual([vp8RtpParameters]);
+
+    const botTransport = await service.createBotRecvTransport("room_1", "rec_1");
+    await expect(
+      service.consumeForBot("room_1", "rec_1", botTransport.id, producer.id, unsupportedH264Capabilities),
+    ).rejects.toMatchObject(new SignalingError("MEDIASOUP_ERROR", "Bot cannot consume producer"));
   });
 
   it("closes consumers for a producer when the producer owner leaves", async () => {
