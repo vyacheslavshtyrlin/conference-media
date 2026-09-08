@@ -48,26 +48,34 @@ let fakeTransportConnections: Array<{ ip?: string; port?: number }> = [];
 let fakeRouters: unknown[] = [];
 let fakePreferredLayers: Array<{ spatialLayer: number; temporalLayer?: number }> = [];
 let fakeConsumerPaused: boolean[] = [];
+let fakeRouterMediaCodecs: Array<Array<Record<string, unknown>>> = [];
+let fakeProducedRtpParameters: Array<Record<string, unknown>> = [];
+let fakeConsumedRtpCapabilities: Array<Record<string, unknown>> = [];
+let fakeCanConsume: (rtpCapabilities: Record<string, unknown>) => boolean = () => true;
 let nextFakeProducerType: FakeProducer["type"] = "simple";
+let fakeConsumeGate: Promise<void> | undefined;
 
 function createFakeWorker() {
   const worker = new EventEmitter() as EventEmitter & {
     observer: EventEmitter;
     close: () => void;
-    createRouter: () => Promise<ReturnType<typeof createFakeRouter>>;
+    createRouter: (options: { mediaCodecs: Array<Record<string, unknown>> }) => Promise<ReturnType<typeof createFakeRouter>>;
   };
   worker.observer = new EventEmitter();
   worker.close = () => {
     worker.observer.emit("close");
   };
-  worker.createRouter = async () => createFakeRouter();
+  worker.createRouter = async ({ mediaCodecs }) => {
+    fakeRouterMediaCodecs.push(mediaCodecs);
+    return createFakeRouter(mediaCodecs);
+  };
   return worker;
 }
 
-function createFakeRouter() {
+function createFakeRouter(mediaCodecs: Array<Record<string, unknown>>) {
   const router = {
-    rtpCapabilities: {},
-    canConsume: () => true,
+    rtpCapabilities: { codecs: mediaCodecs },
+    canConsume: ({ rtpCapabilities }: { rtpCapabilities: Record<string, unknown> }) => fakeCanConsume(rtpCapabilities),
     createAudioLevelObserver: async (options: Record<string, unknown>) => {
       fakeAudioLevelObserverOptions.push(options);
       return createFakeAudioLevelObserver();
@@ -101,9 +109,14 @@ function createFakeTransport() {
     connect: async (parameters: { ip?: string; port?: number }) => {
       fakeTransportConnections.push(parameters);
     },
-    produce: async ({ kind }: { kind: "audio" | "video" }) => createFakeProducer(kind),
-    consume: async ({ producerId, paused }: { producerId: string; paused?: boolean }) => {
+    produce: async ({ kind, rtpParameters }: { kind: "audio" | "video"; rtpParameters: Record<string, unknown> }) => {
+      fakeProducedRtpParameters.push(rtpParameters);
+      return createFakeProducer(kind);
+    },
+    consume: async ({ producerId, paused, rtpCapabilities }: { producerId: string; paused?: boolean; rtpCapabilities: Record<string, unknown> }) => {
       fakeConsumerPaused.push(paused ?? false);
+      fakeConsumedRtpCapabilities.push(rtpCapabilities);
+      await fakeConsumeGate;
       return createFakeConsumer(producerId, paused ?? false);
     },
     close() {
@@ -181,7 +194,12 @@ describe("MediasoupService", () => {
     fakeRouters = [];
     fakePreferredLayers = [];
     fakeConsumerPaused = [];
+    fakeRouterMediaCodecs = [];
+    fakeProducedRtpParameters = [];
+    fakeConsumedRtpCapabilities = [];
+    fakeCanConsume = () => true;
     nextFakeProducerType = "simple";
+    fakeConsumeGate = undefined;
     createWorker.mockImplementation(async () => createFakeWorker());
   });
 
@@ -214,6 +232,120 @@ describe("MediasoupService", () => {
     });
   });
 
+  it("advertises VP8 before the constrained-baseline H.264 tuple", async () => {
+    const service = await createService();
+
+    const capabilities = await service.getRouterRtpCapabilities("room_1");
+
+    expect(fakeRouterMediaCodecs[0]).toEqual([
+      expect.objectContaining({ kind: "audio", mimeType: "audio/opus", clockRate: 48000 }),
+      expect.objectContaining({ kind: "video", mimeType: "video/VP8", clockRate: 90000 }),
+      {
+        kind: "video",
+        mimeType: "video/H264",
+        clockRate: 90000,
+        parameters: {
+          "packetization-mode": 1,
+          "level-asymmetry-allowed": 1,
+          "profile-level-id": "42e01f",
+        },
+      },
+    ]);
+    expect(capabilities.codecs?.map((codec) => codec.mimeType)).toEqual([
+      "audio/opus",
+      "video/VP8",
+      "video/H264",
+    ]);
+  });
+
+  it("produces and consumes the supported constrained-baseline H.264 tuple for a bot", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const h264RtpParameters = {
+      codecs: [{
+        mimeType: "video/H264",
+        payloadType: 102,
+        clockRate: 90000,
+        parameters: {
+          "packetization-mode": 1,
+          "level-asymmetry-allowed": 1,
+          "profile-level-id": "42e01f",
+        },
+      }],
+    };
+    const h264Capabilities = {
+      codecs: [{
+        kind: "video",
+        mimeType: "video/H264",
+        preferredPayloadType: 102,
+        clockRate: 90000,
+        parameters: {
+          "packetization-mode": 1,
+          "level-asymmetry-allowed": 1,
+          "profile-level-id": "42e01f",
+        },
+      }],
+    };
+    fakeCanConsume = (capabilities) => capabilities === h264Capabilities;
+    const producer = await service.produce(
+      "room_1",
+      "peer_1",
+      sendTransport.id,
+      "video",
+      h264RtpParameters,
+      "camera",
+      () => {},
+    );
+    const botTransport = await service.createBotRecvTransport("room_1", "rec_1");
+
+    await expect(
+      service.consumeForBot("room_1", "rec_1", botTransport.id, producer.id, h264Capabilities),
+    ).resolves.toMatchObject({ producerId: producer.id, paused: true });
+    expect(fakeProducedRtpParameters).toEqual([h264RtpParameters]);
+    expect(fakeConsumedRtpCapabilities).toEqual([h264Capabilities]);
+  });
+
+  it("keeps VP8 consumption available and explicitly rejects an unsupported H.264 tuple", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const vp8RtpParameters = {
+      codecs: [{ mimeType: "video/VP8", payloadType: 96, clockRate: 90000 }],
+    };
+    const vp8Capabilities = {
+      codecs: [{ kind: "video", mimeType: "video/VP8", preferredPayloadType: 96, clockRate: 90000 }],
+    };
+    const unsupportedH264Capabilities = {
+      codecs: [{
+        kind: "video",
+        mimeType: "video/H264",
+        preferredPayloadType: 102,
+        clockRate: 90000,
+        parameters: { "packetization-mode": 0, "profile-level-id": "64001f" },
+      }],
+    };
+    fakeCanConsume = (capabilities) => capabilities === vp8Capabilities;
+    const producer = await service.produce(
+      "room_1",
+      "peer_1",
+      sendTransport.id,
+      "video",
+      vp8RtpParameters,
+      "camera",
+      () => {},
+    );
+
+    await expect(
+      service.consume("room_1", "peer_2", recvTransport.id, producer.id, vp8Capabilities),
+    ).resolves.toMatchObject({ producerId: producer.id });
+    expect(fakeProducedRtpParameters).toEqual([vp8RtpParameters]);
+
+    const botTransport = await service.createBotRecvTransport("room_1", "rec_1");
+    await expect(
+      service.consumeForBot("room_1", "rec_1", botTransport.id, producer.id, unsupportedH264Capabilities),
+    ).rejects.toMatchObject(new SignalingError("MEDIASOUP_ERROR", "Bot cannot consume producer"));
+  });
+
   it("closes consumers for a producer when the producer owner leaves", async () => {
     const service = await createService();
     const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
@@ -227,6 +359,78 @@ describe("MediasoupService", () => {
     service.closePeer("room_1", "peer_1");
 
     expect(service.getRuntimeStats()).toMatchObject({ producers: 0, consumers: 0 });
+  });
+
+  it("keeps participant consume idempotent for repeated and concurrent requests", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const producer = await service.produce("room_1", "peer_1", sendTransport.id, "video", {}, "camera", () => {});
+
+    const [first, second] = await Promise.all([
+      service.consume("room_1", "peer_2", recvTransport.id, producer.id, {}),
+      service.consume("room_1", "peer_2", recvTransport.id, producer.id, {}),
+    ]);
+    const third = await service.consume("room_1", "peer_2", recvTransport.id, producer.id, {});
+
+    expect(second.id).toBe(first.id);
+    expect(third.id).toBe(first.id);
+    expect(consumerCounter).toBe(1);
+    expect(service.getRuntimeStats()).toMatchObject({ consumers: 1 });
+  });
+
+  it("replaces an idempotent consumer when the participant receive transport changes", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const firstRecvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const secondRecvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const producer = await service.produce("room_1", "peer_1", sendTransport.id, "video", {}, "camera", () => {});
+
+    const first = await service.consume("room_1", "peer_2", firstRecvTransport.id, producer.id, {});
+    const second = await service.consume("room_1", "peer_2", secondRecvTransport.id, producer.id, {});
+
+    expect(second.id).not.toBe(first.id);
+    expect(consumerCounter).toBe(2);
+    expect(service.getRuntimeStats()).toMatchObject({ consumers: 1 });
+  });
+
+  it("does not charge an idempotent consume against the peer consumer limit", async () => {
+    const service = await createService({ maxConsumersPerPeer: 1 });
+    const firstSendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const secondSendTransport = await service.createWebRtcTransport("room_1", "peer_2", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_3", "recv");
+    const firstProducer = await service.produce("room_1", "peer_1", firstSendTransport.id, "video", {}, "camera", () => {});
+    const secondProducer = await service.produce("room_1", "peer_2", secondSendTransport.id, "video", {}, "camera", () => {});
+
+    const first = await service.consume("room_1", "peer_3", recvTransport.id, firstProducer.id, {});
+    const duplicate = await service.consume("room_1", "peer_3", recvTransport.id, firstProducer.id, {});
+
+    expect(duplicate.id).toBe(first.id);
+    await expect(
+      service.consume("room_1", "peer_3", recvTransport.id, secondProducer.id, {}),
+    ).rejects.toMatchObject(new SignalingError("MEDIASOUP_ERROR", "Peer consumer limit reached"));
+  });
+
+  it("reserves peer consumer capacity across concurrent producers", async () => {
+    const service = await createService({ maxConsumersPerPeer: 1 });
+    const firstSendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const secondSendTransport = await service.createWebRtcTransport("room_1", "peer_2", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_3", "recv");
+    const firstProducer = await service.produce("room_1", "peer_1", firstSendTransport.id, "video", {}, "camera", () => {});
+    const secondProducer = await service.produce("room_1", "peer_2", secondSendTransport.id, "video", {}, "camera", () => {});
+    let releaseConsume!: () => void;
+    fakeConsumeGate = new Promise<void>((resolve) => {
+      releaseConsume = resolve;
+    });
+
+    const firstConsume = service.consume("room_1", "peer_3", recvTransport.id, firstProducer.id, {});
+    await vi.waitFor(() => expect(fakeConsumerPaused).toHaveLength(1));
+
+    await expect(
+      service.consume("room_1", "peer_3", recvTransport.id, secondProducer.id, {}),
+    ).rejects.toMatchObject(new SignalingError("MEDIASOUP_ERROR", "Peer consumer limit reached"));
+    releaseConsume();
+    await expect(firstConsume).resolves.toMatchObject({ producerId: firstProducer.id });
   });
 
   it("keeps one idempotent bot receive transport/consumer and tears it down without touching the live room", async () => {

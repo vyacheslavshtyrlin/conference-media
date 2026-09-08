@@ -56,6 +56,7 @@ describe("RecordingWorkerPool", () => {
     const pool = new RecordingWorkerPool([
       { workerId: "worker-a", controlUrl: "http://worker-a:8090", capacity: 1 },
     ], 1_000);
+    await pool.register({ workerId: "worker-a", generationId: "generation-a", controlUrl: "http://worker-a:8090", capacity: 1 });
     await pool.reserve("rec-recoverable");
     const recover = vi.fn().mockResolvedValue(undefined);
     const monitor = new RecordingWorkerLeaseMonitor(

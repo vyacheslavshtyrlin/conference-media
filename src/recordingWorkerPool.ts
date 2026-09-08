@@ -59,7 +59,7 @@ export class RecordingWorkerPool {
         ...descriptor,
         generationId: randomUUID(),
         occupiedSlots: 0,
-        leaseExpiresAt: this.now() + this.leaseTtlMs,
+        leaseExpiresAt: 0,
       });
     }
   }
@@ -235,48 +235,57 @@ export class RecordingWorkerPool {
 
 export class RecordingWorkerLeaseMonitor {
   private timer?: NodeJS.Timeout;
+  private refreshing = false;
 
   constructor(
     private readonly pool: RecordingWorkerPool,
     private readonly intervalMs: number,
     private readonly fetchHealth: typeof fetch = fetch,
     private readonly onBindingsLost?: (recordingIds: string[]) => Promise<void> | void,
+    private readonly authorization?: () => string,
   ) {}
 
   async refresh(): Promise<void> {
-    const recoverable = new Set<string>();
-    await Promise.allSettled(this.pool.configuredWorkers().map(async (worker) => {
-      const response = await this.fetchHealth(`${worker.controlUrl}/health/ready`, {
-        signal: AbortSignal.timeout(Math.min(this.intervalMs, 5_000)),
-      });
-      if (!response.ok) return;
-      const body = await response.json() as {
-        workerId?: string;
-        generationId?: string;
-        capacity?: number;
-        occupiedSlots?: number;
-        recoverableRecordingIds?: unknown;
-        attempts?: unknown[];
-      };
-      if (body.workerId !== undefined && body.workerId !== worker.workerId) return;
-      await this.pool.register({
-        workerId: worker.workerId,
-        generationId: body.generationId ?? worker.generationId,
-        controlUrl: worker.controlUrl,
-        capacity: body.capacity ?? worker.capacity,
-        occupiedSlots: body.occupiedSlots ?? body.attempts?.length ?? worker.occupiedSlots,
-      });
-      if (Array.isArray(body.recoverableRecordingIds)) {
-        for (const recordingId of body.recoverableRecordingIds) {
-          if (typeof recordingId === "string" && recordingId.length > 0 && recordingId.length <= 160) {
-            recoverable.add(recordingId);
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      const recoverable = new Set<string>();
+      await Promise.allSettled(this.pool.configuredWorkers().map(async (worker) => {
+        const response = await this.fetchHealth(`${worker.controlUrl}/health/ready`, {
+          headers: this.authorization ? { Authorization: this.authorization() } : undefined,
+          signal: AbortSignal.timeout(Math.min(this.intervalMs, 5_000)),
+        });
+        if (!response.ok) return;
+        const body = await response.json() as {
+          workerId?: string;
+          generationId?: string;
+          capacity?: number;
+          occupiedSlots?: number;
+          recoverableRecordingIds?: unknown;
+          attempts?: unknown[];
+        };
+        if (body.workerId !== worker.workerId || typeof body.generationId !== "string") return;
+        await this.pool.register({
+          workerId: worker.workerId,
+          generationId: body.generationId,
+          controlUrl: worker.controlUrl,
+          capacity: body.capacity ?? worker.capacity,
+          occupiedSlots: body.occupiedSlots ?? body.attempts?.length ?? worker.occupiedSlots,
+        });
+        if (Array.isArray(body.recoverableRecordingIds)) {
+          for (const recordingId of body.recoverableRecordingIds) {
+            if (typeof recordingId === "string" && recordingId.length > 0 && recordingId.length <= 160) {
+              recoverable.add(recordingId);
+            }
           }
         }
-      }
-    }));
-    const recoveryIds = new Set(await this.pool.reapExpiredBindings());
-    for (const recordingId of recoverable) recoveryIds.add(recordingId);
-    await this.onBindingsLost?.([...recoveryIds]);
+      }));
+      const recoveryIds = new Set(await this.pool.reapExpiredBindings());
+      for (const recordingId of recoverable) recoveryIds.add(recordingId);
+      await this.onBindingsLost?.([...recoveryIds]);
+    } finally {
+      this.refreshing = false;
+    }
   }
 
   start(): void {

@@ -33,6 +33,7 @@ class FakeRedis implements RedisClient {
   async expire(key: string) { this.expired.push(key); return true; }
   async persist(key: string) { this.persisted.push(key); return true; }
   async del() { return 0; }
+  async eval() { return null; }
 }
 
 function seedIntegrationOwner(redis: FakeRedis) {

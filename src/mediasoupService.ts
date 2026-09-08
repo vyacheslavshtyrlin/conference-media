@@ -35,6 +35,22 @@ type ConsumerRecord = {
   consumer: Consumer;
   participantId: string;
   producerId: string;
+  transportId: string;
+};
+
+type ConsumeResponse = {
+  id: string;
+  producerId: string;
+  kind: MediaKind;
+  rtpParameters: RtpParameters;
+  participantId: string;
+  source: "mic" | "camera" | "screen";
+};
+
+type ConsumerPromiseRecord = {
+  participantId: string;
+  transportId: string;
+  promise: Promise<ConsumeResponse>;
 };
 
 type BotSessionRecord = {
@@ -52,6 +68,8 @@ type RuntimeRoom = {
   transports: Map<string, TransportRecord>;
   producers: Map<string, ProducerRecord>;
   consumers: Map<string, ConsumerRecord>;
+  consumerIdsByPeerProducer: Map<string, string>;
+  consumerPromises: Map<string, ConsumerPromiseRecord>;
   botSessions: Map<string, BotSessionRecord>;
 };
 
@@ -68,6 +86,16 @@ const mediaCodecs = [
     clockRate: 90000,
     parameters: {
       "x-google-start-bitrate": 1000,
+    },
+  },
+  {
+    kind: "video" as const,
+    mimeType: "video/H264",
+    clockRate: 90000,
+    parameters: {
+      "packetization-mode": 1,
+      "level-asymmetry-allowed": 1,
+      "profile-level-id": "42e01f",
     },
   },
 ];
@@ -148,6 +176,8 @@ export class MediasoupService {
       transports: new Map(),
       producers: new Map(),
       consumers: new Map(),
+      consumerIdsByPeerProducer: new Map(),
+      consumerPromises: new Map(),
       botSessions: new Map(),
     };
 
@@ -343,14 +373,7 @@ export class MediasoupService {
     transportId: string,
     producerId: string,
     rtpCapabilities: unknown,
-  ): Promise<{
-    id: string;
-    producerId: string;
-    kind: MediaKind;
-    rtpParameters: RtpParameters;
-    participantId: string;
-    source: "mic" | "camera" | "screen";
-  }> {
+  ): Promise<ConsumeResponse> {
     const room = await this.ensureRoom(roomId);
     const transportRecord = await this.getTransport(
       roomId,
@@ -363,12 +386,6 @@ export class MediasoupService {
         "Receive transport not found",
       );
     }
-    this.assertPeerLimit(
-      room.consumers,
-      participantId,
-      this.config.maxConsumersPerPeer,
-      "Peer consumer limit reached",
-    );
 
     const producerRecord = room.producers.get(producerId);
     if (!producerRecord) {
@@ -387,14 +404,98 @@ export class MediasoupService {
       );
     }
 
+    const peerProducerKey = this.getPeerProducerKey(participantId, producerId);
+    const existingConsumerId = room.consumerIdsByPeerProducer.get(peerProducerKey);
+    const existingRecord = existingConsumerId
+      ? room.consumers.get(existingConsumerId)
+      : undefined;
+    if (existingRecord && !existingRecord.consumer.closed) {
+      if (existingRecord.transportId === transportId) {
+        return this.describeConsumer(existingRecord.consumer, producerRecord);
+      }
+      existingRecord.consumer.close();
+    } else if (existingConsumerId) {
+      room.consumerIdsByPeerProducer.delete(peerProducerKey);
+    }
+
+    const pending = room.consumerPromises.get(peerProducerKey);
+    if (pending) {
+      if (pending.transportId === transportId) {
+        return pending.promise;
+      }
+      try {
+        await pending.promise;
+      } catch {
+        // The new receive transport still gets its own creation attempt below.
+      }
+      return this.consume(roomId, participantId, transportId, producerId, rtpCapabilities);
+    }
+
+    const promise = this.createConsumer(
+      roomId,
+      room,
+      participantId,
+      transportId,
+      transportRecord,
+      producerId,
+      producerRecord,
+      rtpCapabilities,
+      peerProducerKey,
+    );
+    room.consumerPromises.set(peerProducerKey, {
+      participantId,
+      transportId,
+      promise,
+    });
+    try {
+      return await promise;
+    } finally {
+      if (room.consumerPromises.get(peerProducerKey)?.promise === promise) {
+        room.consumerPromises.delete(peerProducerKey);
+      }
+    }
+  }
+
+  private async createConsumer(
+    roomId: string,
+    room: RuntimeRoom,
+    participantId: string,
+    transportId: string,
+    transportRecord: TransportRecord,
+    producerId: string,
+    producerRecord: ProducerRecord,
+    rtpCapabilities: unknown,
+    peerProducerKey: string,
+  ): Promise<ConsumeResponse> {
+    this.assertPeerConsumerCapacity(room, participantId);
+
     const consumer = await transportRecord.transport.consume({
       producerId,
       rtpCapabilities: rtpCapabilities as RtpCapabilities,
       paused: false,
     });
-    room.consumers.set(consumer.id, { consumer, participantId, producerId });
+    if (
+      this.rooms.get(roomId) !== room ||
+      room.transports.get(transportId) !== transportRecord ||
+      transportRecord.transport.closed ||
+      room.producers.get(producerId) !== producerRecord
+    ) {
+      consumer.close();
+      throw new SignalingError("TRANSPORT_NOT_FOUND", "Receive transport not found");
+    }
+
+    room.consumers.set(consumer.id, {
+      consumer,
+      participantId,
+      producerId,
+      transportId,
+    });
+    room.consumerIdsByPeerProducer.set(peerProducerKey, consumer.id);
     consumer.observer.once("close", () => {
       room.consumers.delete(consumer.id);
+      if (room.consumerIdsByPeerProducer.get(peerProducerKey) === consumer.id) {
+        room.consumerIdsByPeerProducer.delete(peerProducerKey);
+      }
       this.logger?.info("mediasoup consumer closed", {
         operation: "mediasoup.consumer.close",
         roomId,
@@ -413,9 +514,16 @@ export class MediasoupService {
       outcome: "ok",
     });
 
+    return this.describeConsumer(consumer, producerRecord);
+  }
+
+  private describeConsumer(
+    consumer: Consumer,
+    producerRecord: ProducerRecord,
+  ): ConsumeResponse {
     return {
       id: consumer.id,
-      producerId,
+      producerId: producerRecord.producer.id,
       kind: consumer.kind,
       rtpParameters: consumer.rtpParameters,
       participantId: producerRecord.participantId,
@@ -825,6 +933,26 @@ export class MediasoupService {
     return false;
   }
 
+  private getPeerProducerKey(participantId: string, producerId: string): string {
+    return JSON.stringify([participantId, producerId]);
+  }
+
+  private assertPeerConsumerCapacity(
+    room: RuntimeRoom,
+    participantId: string,
+  ): void {
+    let count = 0;
+    for (const record of room.consumers.values()) {
+      if (record.participantId === participantId) count += 1;
+    }
+    for (const record of room.consumerPromises.values()) {
+      if (record.participantId === participantId) count += 1;
+    }
+    if (count >= this.config.maxConsumersPerPeer) {
+      throw new SignalingError("MEDIASOUP_ERROR", "Peer consumer limit reached");
+    }
+  }
+
   private closeConsumersForProducer(
     room: RuntimeRoom,
     producerId: string,
@@ -854,6 +982,8 @@ export class MediasoupService {
     room.transports.clear();
     room.producers.clear();
     room.consumers.clear();
+    room.consumerIdsByPeerProducer.clear();
+    room.consumerPromises.clear();
     this.rooms.delete(roomId);
     this.logger?.error("mediasoup runtime room closed after failure", {
       operation: "mediasoup.room.dead",
