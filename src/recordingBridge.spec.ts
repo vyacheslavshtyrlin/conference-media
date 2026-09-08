@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { Participant, RoomMetadata } from "#contracts";
 
-import { HttpRecordingBot, RecordingBridge } from "./recordingBridge.js";
+import { HttpRecordingBot, HttpRecordingControl, RecordingBridge } from "./recordingBridge.js";
 
 const room: RoomMetadata = {
   roomId: "room_1",
@@ -45,8 +45,24 @@ const config = {
 function harness() {
   const control = {
     lookup: vi.fn(async () => ({ integrationId: "integration_1", recordingId: "rec_1", requestedAt: "2026-07-21T11:59:00.000Z", status: "requested" as const })),
-    activate: vi.fn(async () => ({ integrationId: "integration_1", recordingId: "rec_1", requestedAt: "2026-07-21T11:59:00.000Z", status: "capturing" as const })),
+    activate: vi.fn(async () => ({
+      integrationId: "integration_1",
+      recordingId: "rec_1",
+      requestedAt: "2026-07-21T11:59:00.000Z",
+      status: "capturing" as const,
+      protocolVersion: "recording-capture.v2" as const,
+      captureGeneration: 1,
+      captureStartedAt: "2026-07-21T12:00:00.000Z",
+    })),
     closeInputs: vi.fn(async () => undefined),
+    bindFinalization: vi.fn(async () => ({
+      recordingId: "rec_1",
+      protocolVersion: "recording-capture.v2" as const,
+      captureGeneration: 2,
+      captureStartedAt: "2026-07-21T12:00:00.000Z",
+      bindingMode: "seal-only" as const,
+      terminalTimelineEndMs: 8_000,
+    })),
     issueBotAdmission: vi.fn(async () => ({ protocolVersion: "recording-bot.v1" as const, admission: "bot-admission", expiresAt: "2026-07-21T12:01:00.000Z" })),
   };
   const bot = {
@@ -54,7 +70,22 @@ function harness() {
     stop: vi.fn(async () => undefined),
     finalize: vi.fn(async () => undefined),
   };
-  return { bridge: new RecordingBridge(control, bot, config), control, bot };
+  const finalizationStore = {
+    beginV2RecordingFinalization: vi.fn(async () => ({
+      protocolVersion: "recording-capture.v2" as const,
+      captureGeneration: 1,
+      activatedAt: "2026-07-21T12:00:00.000Z",
+      captureStartedAt: "2026-07-21T12:00:00.000Z",
+      terminalObservedAt: "2026-07-21T12:00:08.000Z",
+      terminalTimelineEndMs: 8_000,
+    })),
+  };
+  return {
+    bridge: new RecordingBridge(control, bot, finalizationStore, config),
+    control,
+    bot,
+    finalizationStore,
+  };
 }
 
 describe("RecordingBridge", () => {
@@ -66,13 +97,22 @@ describe("RecordingBridge", () => {
     await bridge.stopRoom(room.roomId);
 
     expect(control.activate).toHaveBeenCalledTimes(1);
+    expect(control.activate).toHaveBeenCalledWith(
+      "room_1",
+      expect.objectContaining({ workerId: "worker-a" }),
+    );
     expect(control.issueBotAdmission).toHaveBeenCalledWith("rec_1");
     expect(bot.create).toHaveBeenCalledWith(
       expect.objectContaining({ workerId: "worker-a", recordingId: "rec_1" }),
       expect.objectContaining({ roomId: "room_1", recordingId: "rec_1", admission: "bot-admission" }),
     );
     expect(bot.stop).toHaveBeenCalledTimes(1);
-    expect(control.closeInputs).toHaveBeenCalledTimes(1);
+    expect(control.closeInputs).toHaveBeenCalledWith("rec_1", {
+      captureGeneration: 1,
+      terminalTimelineEndMs: 8_000,
+    });
+    expect(control.closeInputs.mock.invocationCallOrder[0])
+      .toBeLessThan(bot.stop.mock.invocationCallOrder[0]!);
   });
 
   it("does nothing when recording was not requested", async () => {
@@ -189,6 +229,10 @@ describe("RecordingBridge", () => {
       }),
       expect.objectContaining({ roomId: "room_1", recordingId: "rec_1" }),
     );
+    expect(control.bindFinalization).toHaveBeenCalledWith(
+      "rec_1",
+      expect.objectContaining({ workerId: "worker-b" }),
+    );
     expect(control.closeInputs).toHaveBeenCalledTimes(1);
     expect(bridge.getWorkerPoolSnapshot()).toMatchObject({ healthyWorkers: 1, occupiedSlots: 0 });
   });
@@ -205,13 +249,13 @@ describe("RecordingBridge", () => {
     await bridge.stopRoom(room.roomId);
 
     expect(bot.finalize).toHaveBeenCalledTimes(3);
-    expect(control.closeInputs).not.toHaveBeenCalled();
+    expect(control.closeInputs).toHaveBeenCalledTimes(1);
     expect(bridge.getWorkerPoolSnapshot().occupiedSlots).toBe(0);
 
     await bridge.retryFinalization("rec_1");
 
     expect(bot.finalize).toHaveBeenCalledTimes(4);
-    expect(control.closeInputs).toHaveBeenCalledTimes(1);
+    expect(control.closeInputs).toHaveBeenCalledTimes(2);
     expect(bridge.getWorkerPoolSnapshot().occupiedSlots).toBe(0);
   });
 });
@@ -239,6 +283,8 @@ describe("HttpRecordingBot generation fencing", () => {
         ...common,
         signalingUrl: "ws://signaling:4000/internal/recording-bot/v1",
         admission: "admission",
+        captureGeneration: 1,
+        captureStartedAt: "2026-07-21T12:00:00.000Z",
       });
       await worker.stop(binding, "rec_1");
       await worker.finalize(binding, common);
@@ -259,7 +305,13 @@ describe("HttpRecordingBot generation fencing", () => {
         expect(init.headers).not.toHaveProperty("X-Recording-Worker-Generation");
       }
       expect(JSON.parse(String(calls[0]?.[1].body)))
-        .toMatchObject({ workerId: "worker-a", workerGenerationId: "generation-a" });
+        .toMatchObject({
+          protocolVersion: "recording-capture.v2",
+          workerId: "worker-a",
+          workerGenerationId: "generation-a",
+          captureGeneration: 1,
+          captureStartedAt: "2026-07-21T12:00:00.000Z",
+        });
       expect(calls[1]?.[1].body).toBeUndefined();
       expect(JSON.parse(String(calls[2]?.[1].body)))
         .toMatchObject({ workerId: "worker-a", workerGenerationId: "generation-a" });
@@ -267,6 +319,69 @@ describe("HttpRecordingBot generation fencing", () => {
         .not.toHaveProperty("generationId");
       expect(JSON.parse(String(calls[2]?.[1].body)))
         .not.toHaveProperty("generationId");
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe("HttpRecordingControl v2 lifecycle", () => {
+  it("sends the worker binding on activation and the terminal fence on close", async () => {
+    const request = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        integrationId: "integration_1",
+        recordingId: "rec_1",
+        requestedAt: "2026-07-21T11:59:00.000Z",
+        status: "capturing",
+        protocolVersion: "recording-capture.v2",
+        captureGeneration: 4,
+        captureStartedAt: "2026-07-21T12:00:00.000Z",
+      }), { status: 201, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        recordingId: "rec_1",
+        status: "finalizing",
+        protocolVersion: "recording-capture.v2",
+        captureGeneration: 4,
+        terminalTimelineEndMs: 8_000,
+      }), { status: 201, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        recordingId: "rec_1",
+        protocolVersion: "recording-capture.v2",
+        captureGeneration: 5,
+        captureStartedAt: "2026-07-21T12:00:00.000Z",
+        bindingMode: "seal-only",
+        terminalTimelineEndMs: 8_000,
+      }), { status: 201, headers: { "Content-Type": "application/json" } }));
+    vi.stubGlobal("fetch", request);
+    try {
+      const control = new HttpRecordingControl(config.controlUrl, config.controlJwt);
+      const binding = {
+        workerId: "worker-a",
+        generationId: "generation-a",
+        controlUrl: "http://worker-a:8090",
+        recordingId: "rec_1",
+      };
+      await control.activate("room_1", binding);
+      await control.closeInputs("rec_1", { captureGeneration: 4, terminalTimelineEndMs: 8_000 });
+      await control.bindFinalization("rec_1", binding);
+
+      const calls = request.mock.calls as unknown as Array<[string, RequestInit]>;
+      expect(JSON.parse(String(calls[0]?.[1].body))).toEqual({
+        protocolVersion: "recording-capture.v2",
+        workerId: "worker-a",
+        workerGenerationId: "generation-a",
+      });
+      expect(JSON.parse(String(calls[1]?.[1].body))).toEqual({
+        protocolVersion: "recording-capture.v2",
+        captureGeneration: 4,
+        terminalTimelineEndMs: 8_000,
+      });
+      expect(calls[2]?.[0]).toContain("/capture-v2/finalization-bind");
+      expect(JSON.parse(String(calls[2]?.[1].body))).toEqual({
+        protocolVersion: "recording-capture.v2",
+        workerId: "worker-a",
+        workerGenerationId: "generation-a",
+      });
     } finally {
       vi.unstubAllGlobals();
     }

@@ -58,7 +58,7 @@ try {
   await redis.quit();
   throw error;
 }
-const recordingBridge = createRecordingBridge(mediasoup, config.recording, logger);
+const recordingBridge = createRecordingBridge(repository, config.recording, logger);
 await recordingBridge?.start();
 const roomHistory = createRoomHistoryBridge(redis, config.recording);
 roomHistory?.start();

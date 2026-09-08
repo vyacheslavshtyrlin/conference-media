@@ -53,6 +53,7 @@ let fakeProducedRtpParameters: Array<Record<string, unknown>> = [];
 let fakeConsumedRtpCapabilities: Array<Record<string, unknown>> = [];
 let fakeCanConsume: (rtpCapabilities: Record<string, unknown>) => boolean = () => true;
 let nextFakeProducerType: FakeProducer["type"] = "simple";
+let fakeConsumeGate: Promise<void> | undefined;
 
 function createFakeWorker() {
   const worker = new EventEmitter() as EventEmitter & {
@@ -115,6 +116,7 @@ function createFakeTransport() {
     consume: async ({ producerId, paused, rtpCapabilities }: { producerId: string; paused?: boolean; rtpCapabilities: Record<string, unknown> }) => {
       fakeConsumerPaused.push(paused ?? false);
       fakeConsumedRtpCapabilities.push(rtpCapabilities);
+      await fakeConsumeGate;
       return createFakeConsumer(producerId, paused ?? false);
     },
     close() {
@@ -197,6 +199,7 @@ describe("MediasoupService", () => {
     fakeConsumedRtpCapabilities = [];
     fakeCanConsume = () => true;
     nextFakeProducerType = "simple";
+    fakeConsumeGate = undefined;
     createWorker.mockImplementation(async () => createFakeWorker());
   });
 
@@ -356,6 +359,78 @@ describe("MediasoupService", () => {
     service.closePeer("room_1", "peer_1");
 
     expect(service.getRuntimeStats()).toMatchObject({ producers: 0, consumers: 0 });
+  });
+
+  it("keeps participant consume idempotent for repeated and concurrent requests", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const producer = await service.produce("room_1", "peer_1", sendTransport.id, "video", {}, "camera", () => {});
+
+    const [first, second] = await Promise.all([
+      service.consume("room_1", "peer_2", recvTransport.id, producer.id, {}),
+      service.consume("room_1", "peer_2", recvTransport.id, producer.id, {}),
+    ]);
+    const third = await service.consume("room_1", "peer_2", recvTransport.id, producer.id, {});
+
+    expect(second.id).toBe(first.id);
+    expect(third.id).toBe(first.id);
+    expect(consumerCounter).toBe(1);
+    expect(service.getRuntimeStats()).toMatchObject({ consumers: 1 });
+  });
+
+  it("replaces an idempotent consumer when the participant receive transport changes", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const firstRecvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const secondRecvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    const producer = await service.produce("room_1", "peer_1", sendTransport.id, "video", {}, "camera", () => {});
+
+    const first = await service.consume("room_1", "peer_2", firstRecvTransport.id, producer.id, {});
+    const second = await service.consume("room_1", "peer_2", secondRecvTransport.id, producer.id, {});
+
+    expect(second.id).not.toBe(first.id);
+    expect(consumerCounter).toBe(2);
+    expect(service.getRuntimeStats()).toMatchObject({ consumers: 1 });
+  });
+
+  it("does not charge an idempotent consume against the peer consumer limit", async () => {
+    const service = await createService({ maxConsumersPerPeer: 1 });
+    const firstSendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const secondSendTransport = await service.createWebRtcTransport("room_1", "peer_2", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_3", "recv");
+    const firstProducer = await service.produce("room_1", "peer_1", firstSendTransport.id, "video", {}, "camera", () => {});
+    const secondProducer = await service.produce("room_1", "peer_2", secondSendTransport.id, "video", {}, "camera", () => {});
+
+    const first = await service.consume("room_1", "peer_3", recvTransport.id, firstProducer.id, {});
+    const duplicate = await service.consume("room_1", "peer_3", recvTransport.id, firstProducer.id, {});
+
+    expect(duplicate.id).toBe(first.id);
+    await expect(
+      service.consume("room_1", "peer_3", recvTransport.id, secondProducer.id, {}),
+    ).rejects.toMatchObject(new SignalingError("MEDIASOUP_ERROR", "Peer consumer limit reached"));
+  });
+
+  it("reserves peer consumer capacity across concurrent producers", async () => {
+    const service = await createService({ maxConsumersPerPeer: 1 });
+    const firstSendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const secondSendTransport = await service.createWebRtcTransport("room_1", "peer_2", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_3", "recv");
+    const firstProducer = await service.produce("room_1", "peer_1", firstSendTransport.id, "video", {}, "camera", () => {});
+    const secondProducer = await service.produce("room_1", "peer_2", secondSendTransport.id, "video", {}, "camera", () => {});
+    let releaseConsume!: () => void;
+    fakeConsumeGate = new Promise<void>((resolve) => {
+      releaseConsume = resolve;
+    });
+
+    const firstConsume = service.consume("room_1", "peer_3", recvTransport.id, firstProducer.id, {});
+    await vi.waitFor(() => expect(fakeConsumerPaused).toHaveLength(1));
+
+    await expect(
+      service.consume("room_1", "peer_3", recvTransport.id, secondProducer.id, {}),
+    ).rejects.toMatchObject(new SignalingError("MEDIASOUP_ERROR", "Peer consumer limit reached"));
+    releaseConsume();
+    await expect(firstConsume).resolves.toMatchObject({ producerId: firstProducer.id });
   });
 
   it("keeps one idempotent bot receive transport/consumer and tears it down without touching the live room", async () => {

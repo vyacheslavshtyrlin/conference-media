@@ -4,6 +4,7 @@ import type { MediaKind, MediaSource, Participant, RoomMetadata } from "#contrac
 
 import type { ServiceJwtConfig, SignalingConfig } from "./config.js";
 import type { Logger } from "./logger.js";
+import type { RecordingV2FinalizationFence } from "./redisRoomRepository.js";
 import {
   RecordingWorkerLeaseMonitor,
   RecordingWorkerPool,
@@ -16,6 +17,22 @@ type RecordingProjection = {
   integrationId: string;
   requestedAt: string;
   status: "requested" | "capturing" | "finalizing";
+};
+
+type CaptureV2Projection = RecordingProjection & {
+  status: "capturing";
+  protocolVersion: "recording-capture.v2";
+  captureGeneration: number;
+  captureStartedAt: string;
+};
+
+type CaptureV2FinalizationBinding = {
+  recordingId: string;
+  protocolVersion: "recording-capture.v2";
+  captureGeneration: number;
+  captureStartedAt: string;
+  bindingMode: "seal-only";
+  terminalTimelineEndMs: number;
 };
 
 export type RecorderProducer = {
@@ -37,13 +54,34 @@ export interface RoomRecordingBridge {
 
 type RecordingControl = {
   lookup(roomId: string): Promise<RecordingProjection | undefined>;
-  activate(roomId: string): Promise<RecordingProjection | undefined>;
-  closeInputs(recordingId: string): Promise<void>;
+  activate(roomId: string, binding: RecordingWorkerBinding): Promise<CaptureV2Projection | undefined>;
+  closeInputs(recordingId: string, input: {
+    captureGeneration: number;
+    terminalTimelineEndMs: number;
+  }): Promise<void>;
+  bindFinalization(recordingId: string, binding: RecordingWorkerBinding): Promise<CaptureV2FinalizationBinding>;
   issueBotAdmission(recordingId: string): Promise<{ protocolVersion: "recording-bot.v1"; admission: string; expiresAt: string }>;
 };
 
+type RecordingFinalizationStore = {
+  beginV2RecordingFinalization(
+    recordingId: string,
+    captureGeneration: number,
+  ): Promise<RecordingV2FinalizationFence>;
+};
+
 type RecordingBotWorker = {
-  create(binding: RecordingWorkerBinding, input: { attemptId: string; roomId: string; recordingId: string; integrationId: string; requestedAt: string; signalingUrl: string; admission: string }): Promise<void>;
+  create(binding: RecordingWorkerBinding, input: {
+    attemptId: string;
+    roomId: string;
+    recordingId: string;
+    integrationId: string;
+    requestedAt: string;
+    signalingUrl: string;
+    admission: string;
+    captureGeneration: number;
+    captureStartedAt: string;
+  }): Promise<void>;
   stop(binding: RecordingWorkerBinding, recordingId: string): Promise<void>;
   finalize(binding: RecordingWorkerBinding, input: {
     attemptId: string;
@@ -57,6 +95,7 @@ type RecordingBotWorker = {
 type Session = {
   room: RoomMetadata;
   projection: RecordingProjection;
+  capture?: CaptureV2Projection;
   binding?: RecordingWorkerBinding;
   startPromise?: Promise<void>;
   stopping?: boolean;
@@ -86,6 +125,7 @@ export class RecordingBridge implements RoomRecordingBridge {
   constructor(
     private readonly control: RecordingControl,
     private readonly bot: RecordingBotWorker,
+    private readonly finalizationStore: RecordingFinalizationStore,
     private readonly config: NonNullable<SignalingConfig["recording"]>,
     private readonly logger?: Logger,
     readonly workerPool = new RecordingWorkerPool(config.bot.workers, config.bot.workerLeaseTtlMs),
@@ -105,6 +145,11 @@ export class RecordingBridge implements RoomRecordingBridge {
         await this.recoverLostBindings(recordingIds);
         await this.retryPendingFinalizations();
       },
+      () => `Bearer ${createServiceJwt(
+        this.config.bot.controlJwt,
+        "recording-bot-control+jwt",
+        "conference-signaling",
+      )}`,
     );
   }
 
@@ -132,7 +177,7 @@ export class RecordingBridge implements RoomRecordingBridge {
       let lastError: unknown;
       for (let attempt = 1; attempt <= RECOVERY_MAX_ATTEMPTS; attempt += 1) {
         try {
-          await this.startBot(session);
+          await this.bindAndStartBot(session);
           this.logger?.warn("recording worker binding recovered", {
             operation: "recording.worker.recover",
             roomId: session.room.roomId,
@@ -240,7 +285,7 @@ export class RecordingBridge implements RoomRecordingBridge {
     if (requested.status === "finalizing") throw new Error("Recording is already finalizing");
     const session: Session = { room, projection: requested };
     this.sessions.set(room.roomId, session);
-    session.startPromise = this.prepareAndStartBot(session);
+    session.startPromise = this.bindAndStartBot(session);
     try {
       await session.startPromise;
     } catch (error) {
@@ -253,14 +298,16 @@ export class RecordingBridge implements RoomRecordingBridge {
     }
   }
 
-  private async prepareAndStartBot(session: Session): Promise<void> {
-    session.binding = await this.workerPool.reserve(session.projection.recordingId);
+  private async bindAndStartBot(session: Session): Promise<void> {
+    const binding = await this.workerPool.reserve(session.projection.recordingId);
+    session.binding = binding;
     try {
-      const activated = await this.control.activate(session.room.roomId);
-      if (!activated || activated.recordingId !== session.projection.recordingId || activated.status === "finalizing") {
+      const activated = await this.control.activate(session.room.roomId, binding);
+      if (!activated || activated.recordingId !== session.projection.recordingId) {
         throw new Error("Recording activation did not establish a capturable attempt");
       }
       session.projection = activated;
+      session.capture = activated;
       await this.startBot(session);
     } catch (error) {
       await this.workerPool.release(session.projection.recordingId);
@@ -270,9 +317,9 @@ export class RecordingBridge implements RoomRecordingBridge {
   }
 
   private async startBot(session: Session): Promise<void> {
-    const activated = session.projection;
-    const binding = session.binding ?? await this.workerPool.reserve(activated.recordingId);
-    session.binding = binding;
+    const activated = session.capture;
+    const binding = session.binding;
+    if (!activated || !binding) throw new Error("Recording capture binding is missing");
     const admission = await this.control.issueBotAdmission(activated.recordingId);
     await this.bot.create(binding, {
       attemptId: randomUUID(),
@@ -282,6 +329,8 @@ export class RecordingBridge implements RoomRecordingBridge {
       requestedAt: activated.requestedAt,
       signalingUrl: this.config.bot.signalingUrl,
       admission: admission.admission,
+      captureGeneration: activated.captureGeneration,
+      captureStartedAt: activated.captureStartedAt,
     });
   }
 
@@ -299,6 +348,15 @@ export class RecordingBridge implements RoomRecordingBridge {
   private async finalizeSession(session: Session, tryAssignedWorker: boolean): Promise<void> {
     const recordingId = session.projection.recordingId;
     try {
+      if (!session.capture) throw new Error("Recording capture binding is missing");
+      const terminal = await this.finalizationStore.beginV2RecordingFinalization(
+        recordingId,
+        session.capture.captureGeneration,
+      );
+      await this.control.closeInputs(recordingId, {
+        captureGeneration: terminal.captureGeneration,
+        terminalTimelineEndMs: terminal.terminalTimelineEndMs,
+      });
       if (!session.workerFinalized && tryAssignedWorker && session.binding) {
         try {
           await this.bot.stop(session.binding, recordingId);
@@ -316,6 +374,11 @@ export class RecordingBridge implements RoomRecordingBridge {
           try {
             const binding = await this.workerPool.reserve(recordingId);
             session.binding = binding;
+            const finalizationBinding = await this.control.bindFinalization(recordingId, binding);
+            if (finalizationBinding.captureStartedAt !== session.capture.captureStartedAt ||
+              finalizationBinding.terminalTimelineEndMs !== terminal.terminalTimelineEndMs) {
+              throw new Error("Recording finalization binding does not match the terminal fence");
+            }
             await this.bot.finalize(binding, {
               attemptId: randomUUID(),
               roomId: session.room.roomId,
@@ -336,7 +399,6 @@ export class RecordingBridge implements RoomRecordingBridge {
         }
         if (!session.workerFinalized) throw lastError;
       }
-      await this.control.closeInputs(recordingId);
       this.pendingFinalizations.delete(recordingId);
       await this.workerPool.release(recordingId);
       this.sessions.delete(session.room.roomId);
@@ -399,7 +461,7 @@ export class RecordingBridge implements RoomRecordingBridge {
 }
 
 export function createRecordingBridge(
-  _media: unknown,
+  finalizationStore: RecordingFinalizationStore,
   config: SignalingConfig["recording"],
   logger?: Logger,
 ): RecordingBridge | undefined {
@@ -407,12 +469,13 @@ export function createRecordingBridge(
   return new RecordingBridge(
     new HttpRecordingControl(config.controlUrl, config.controlJwt),
     new HttpRecordingBot(config.bot.controlJwt),
+    finalizationStore,
     config,
     logger,
   );
 }
 
-class HttpRecordingControl implements RecordingControl {
+export class HttpRecordingControl implements RecordingControl {
   constructor(private readonly baseUrl: string, private readonly jwt: ServiceJwtConfig) {}
 
   async lookup(roomId: string): Promise<RecordingProjection | undefined> {
@@ -421,15 +484,51 @@ class HttpRecordingControl implements RecordingControl {
     return readProjection(response);
   }
 
-  async activate(roomId: string): Promise<RecordingProjection | undefined> {
-    const response = await request(`${this.baseUrl}/rooms/${encodeURIComponent(roomId)}/recording/activate`, this.jwt, "POST");
+  async activate(roomId: string, binding: RecordingWorkerBinding): Promise<CaptureV2Projection | undefined> {
+    const response = await request(
+      `${this.baseUrl}/rooms/${encodeURIComponent(roomId)}/recording/activate`,
+      this.jwt,
+      "POST",
+      {
+        protocolVersion: "recording-capture.v2",
+        workerId: binding.workerId,
+        workerGenerationId: binding.generationId,
+      },
+    );
     if (response.status === 204 || response.status === 404) return undefined;
-    return readProjection(response);
+    return readCaptureV2Projection(response);
   }
 
-  async closeInputs(recordingId: string): Promise<void> {
-    const response = await request(`${this.baseUrl}/recordings/${encodeURIComponent(recordingId)}/close-inputs`, this.jwt, "POST");
+  async closeInputs(recordingId: string, input: { captureGeneration: number; terminalTimelineEndMs: number }): Promise<void> {
+    const response = await request(
+      `${this.baseUrl}/recordings/${encodeURIComponent(recordingId)}/close-inputs`,
+      this.jwt,
+      "POST",
+      { protocolVersion: "recording-capture.v2", ...input },
+    );
     if (response.status !== 201 && response.status !== 204) throw await responseError(response);
+  }
+
+  async bindFinalization(
+    recordingId: string,
+    binding: RecordingWorkerBinding,
+  ): Promise<CaptureV2FinalizationBinding> {
+    const response = await request(
+      `${this.baseUrl}/recordings/${encodeURIComponent(recordingId)}/capture-v2/finalization-bind`,
+      this.jwt,
+      "POST",
+      {
+        protocolVersion: "recording-capture.v2",
+        workerId: binding.workerId,
+        workerGenerationId: binding.generationId,
+      },
+    );
+    if (!response.ok) throw await responseError(response);
+    const value: unknown = await response.json();
+    if (!isCaptureV2FinalizationBinding(value) || value.recordingId !== recordingId) {
+      throw new Error("Invalid recording finalization binding response");
+    }
+    return value;
   }
 
   async issueBotAdmission(recordingId: string): Promise<{ protocolVersion: "recording-bot.v1"; admission: string; expiresAt: string }> {
@@ -444,13 +543,23 @@ class HttpRecordingControl implements RecordingControl {
 export class HttpRecordingBot implements RecordingBotWorker {
   constructor(private readonly jwt: ServiceJwtConfig) {}
 
-  async create(binding: RecordingWorkerBinding, input: { attemptId: string; roomId: string; recordingId: string; integrationId: string; requestedAt: string; signalingUrl: string; admission: string }): Promise<void> {
+  async create(binding: RecordingWorkerBinding, input: {
+    attemptId: string;
+    roomId: string;
+    recordingId: string;
+    integrationId: string;
+    requestedAt: string;
+    signalingUrl: string;
+    admission: string;
+    captureGeneration: number;
+    captureStartedAt: string;
+  }): Promise<void> {
     const response = await fetch(`${binding.controlUrl}/internal/v1/attempts/${encodeURIComponent(input.recordingId)}`, {
       method: "PUT",
       headers: this.headers(binding, true),
       body: JSON.stringify({
         ...input,
-        protocolVersion: "recording-bot.v1",
+        protocolVersion: "recording-capture.v2",
         workerId: binding.workerId,
         workerGenerationId: binding.generationId,
       }),
@@ -498,10 +607,19 @@ export class HttpRecordingBot implements RecordingBotWorker {
   }
 }
 
-async function request(url: string, jwt: ServiceJwtConfig, method: "GET" | "POST"): Promise<Response> {
+async function request(
+  url: string,
+  jwt: ServiceJwtConfig,
+  method: "GET" | "POST",
+  body?: Record<string, unknown>,
+): Promise<Response> {
   return fetch(url, {
     method,
-    headers: { Authorization: `Bearer ${createServiceJwt(jwt)}` },
+    headers: {
+      Authorization: `Bearer ${createServiceJwt(jwt)}`,
+      ...(body ? { "Content-Type": "application/json" } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
     signal: AbortSignal.timeout(10_000),
   });
 }
@@ -528,6 +646,33 @@ function isProjection(value: unknown): value is RecordingProjection {
     && typeof candidate.integrationId === "string"
     && typeof candidate.requestedAt === "string"
     && (candidate.status === "requested" || candidate.status === "capturing" || candidate.status === "finalizing");
+}
+
+function isCaptureV2Projection(value: unknown): value is CaptureV2Projection {
+  return isProjection(value) && value.status === "capturing" &&
+    (value as Partial<CaptureV2Projection>).protocolVersion === "recording-capture.v2" &&
+    Number.isSafeInteger((value as Partial<CaptureV2Projection>).captureGeneration) &&
+    Number((value as Partial<CaptureV2Projection>).captureGeneration) > 0 &&
+    typeof (value as Partial<CaptureV2Projection>).captureStartedAt === "string" &&
+    !Number.isNaN(Date.parse(String((value as Partial<CaptureV2Projection>).captureStartedAt)));
+}
+
+async function readCaptureV2Projection(response: Response): Promise<CaptureV2Projection> {
+  if (!response.ok) throw await responseError(response);
+  const value: unknown = await response.json();
+  if (!isCaptureV2Projection(value)) throw new Error("Invalid recording-capture.v2 activation response");
+  return value;
+}
+
+function isCaptureV2FinalizationBinding(value: unknown): value is CaptureV2FinalizationBinding {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as Partial<CaptureV2FinalizationBinding>;
+  return typeof candidate.recordingId === "string" &&
+    candidate.protocolVersion === "recording-capture.v2" &&
+    Number.isSafeInteger(candidate.captureGeneration) && Number(candidate.captureGeneration) > 0 &&
+    typeof candidate.captureStartedAt === "string" && !Number.isNaN(Date.parse(candidate.captureStartedAt)) &&
+    candidate.bindingMode === "seal-only" &&
+    Number.isSafeInteger(candidate.terminalTimelineEndMs) && Number(candidate.terminalTimelineEndMs) >= 0;
 }
 
 function isBotAdmission(value: unknown): value is { protocolVersion: "recording-bot.v1"; admission: string; expiresAt: string } {
