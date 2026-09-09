@@ -20,6 +20,7 @@ import type { RedisRoomRepository } from "./redisRoomRepository.js";
 import type { JoinTokenPayload } from "./token.js";
 import type { RecorderProducer, RoomRecordingBridge } from "./recordingBridge.js";
 import type { BotAuthoritySnapshot, RecordingBotSessionManager } from "./recordingBot.js";
+import { RecordingCapacityError } from "./recordingWorkerPool.js";
 import type { RoomHistoryBridge } from "./roomHistoryBridge.js";
 
 type RuntimeRoomState = {
@@ -40,6 +41,7 @@ const RECORDING_STOP_DISPATCH_TIMEOUT_MS = 5_000;
 export class RoomManager {
   private readonly rooms = new Map<string, RuntimeRoomState>();
   private readonly roomLocks = new Map<string, Mutex>();
+  private readonly recordingBootstrapSnapshots = new Map<string, BotAuthoritySnapshot>();
   private onRoomClosedCallback?: (roomId: string, reason: RoomClosedReason) => void;
   private onActiveSpeakerChangedCallback?: (roomId: string, participantId: string | null) => void;
 
@@ -92,7 +94,9 @@ export class RoomManager {
 
       const alreadyJoined = Boolean(state.peers.getPeer(payload.participantId));
       const isFirstHuman = state.peers.count() === 0 && !alreadyJoined;
+      const participant = state.peers.addPeer(payload);
       if (isFirstHuman && metadata.recordingRequested && this.recording) {
+        this.recordingBootstrapSnapshots.set(metadata.roomId, this.buildBotAuthoritySnapshot(metadata.roomId));
         try {
           await this.recording.roomBecameLive(
             metadata,
@@ -100,17 +104,32 @@ export class RoomManager {
             this.mediasoup.listProducers(metadata.roomId),
           );
         } catch (error) {
+          const capacityFailure = error instanceof RecordingCapacityError;
           if (shouldRestoreEmptyTtl) {
             state.metadata = await this.repository.markRoomEmpty(state.metadata).catch(() => state.metadata);
           }
           this.mediasoup.closeRoom(metadata.roomId);
           this.rooms.delete(metadata.roomId);
-          this.metrics.recordRoomCleanup({ operation: "join_rollback", outcome: "ok", reason: "recording_capacity" });
-          this.recording.logFailure("recording.capacityAdmission", metadata.roomId, error);
-          throw new SignalingError("MEDIASOUP_ERROR", "Recording capacity is temporarily unavailable");
+          this.metrics.recordRoomCleanup({
+            operation: "join_rollback",
+            outcome: "ok",
+            reason: capacityFailure ? "recording_capacity" : "recording_startup",
+          });
+          this.recording.logFailure(
+            capacityFailure ? "recording.capacityAdmission" : "recording.startup",
+            metadata.roomId,
+            error,
+          );
+          throw new SignalingError(
+            "MEDIASOUP_ERROR",
+            capacityFailure
+              ? "Recording capacity is temporarily unavailable"
+              : "Recording service is temporarily unavailable",
+          );
+        } finally {
+          this.recordingBootstrapSnapshots.delete(metadata.roomId);
         }
       }
-      const participant = state.peers.addPeer(payload);
       let participantSaved = false;
 
       if (state.cleanupTimer) {
@@ -784,8 +803,9 @@ export class RoomManager {
   }
 
   async shutdown(): Promise<void> {
-    for (const roomId of [...this.rooms.keys()]) {
-      await this.runExclusive(roomId, async () => {
+    const roomIds = [...this.rooms.keys()];
+    const results = await Promise.allSettled(roomIds.map((roomId) =>
+      this.runExclusive(roomId, async () => {
         const state = this.rooms.get(roomId);
         if (!state) {
           return;
@@ -828,8 +848,12 @@ export class RoomManager {
           roomId,
           outcome: "ok",
         });
-      });
-    }
+      }),
+    ));
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+      .map((result) => result.reason);
+    if (failures.length > 0) throw new AggregateError(failures, "Room shutdown failed");
   }
 
   private runExclusive<T>(roomId: string, operation: () => Promise<T>): Promise<T> {
@@ -895,6 +919,11 @@ export class RoomManager {
   }
 
   freezeBotAuthoritySnapshot(roomId: string, accept: (snapshot: BotAuthoritySnapshot) => void): Promise<void> {
+    const bootstrapSnapshot = this.recordingBootstrapSnapshots.get(roomId);
+    if (bootstrapSnapshot) {
+      accept(bootstrapSnapshot);
+      return Promise.resolve();
+    }
     return this.runExclusive(roomId, async () => {
       accept(this.buildBotAuthoritySnapshot(roomId));
     });

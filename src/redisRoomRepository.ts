@@ -39,6 +39,17 @@ export type RecordingV2FinalizationFence = {
   terminalTimelineEndMs: number;
 };
 
+export type RecordingRecoveryContext = {
+  roomId: string;
+  integrationId: string;
+  requestedAt: string;
+};
+
+export type RecordingV2Activation = {
+  captureGeneration: number;
+  activatedAt: string;
+};
+
 export class RedisRoomRepository {
   constructor(
     private readonly redis: RedisClient,
@@ -235,6 +246,43 @@ export class RedisRoomRepository {
     return fence;
   }
 
+  async getRecordingRecoveryContext(recordingId: string): Promise<RecordingRecoveryContext | undefined> {
+    const raw = await this.recordRedis(
+      "get_recording_recovery_context",
+      () => this.redis.get(`integration_recording:${recordingId}`),
+    );
+    if (!raw) return undefined;
+    try {
+      const owner = JSON.parse(raw) as Record<string, unknown>;
+      if (owner.recordingId !== recordingId || typeof owner.roomId !== "string" ||
+        typeof owner.integrationId !== "string" || typeof owner.createdAt !== "string" ||
+        Number.isNaN(Date.parse(owner.createdAt))) {
+        return undefined;
+      }
+      return {
+        roomId: owner.roomId,
+        integrationId: owner.integrationId,
+        requestedAt: owner.createdAt,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  async getV2RecordingFinalization(recordingId: string): Promise<RecordingV2FinalizationFence | undefined> {
+    return parseRecordingV2FinalizationFence(await this.recordRedis(
+      "get_recording_v2_finalization",
+      () => this.redis.get(`recording_finalizing:${recordingId}`),
+    ));
+  }
+
+  async getV2RecordingActivation(recordingId: string): Promise<RecordingV2Activation | undefined> {
+    return parseRecordingV2Activation(await this.recordRedis(
+      "get_recording_v2_activation",
+      () => this.redis.get(`recording_activation:${recordingId}`),
+    ));
+  }
+
   private roomKey(roomId: string): string {
     return `room:${roomId}`;
   }
@@ -381,10 +429,7 @@ redis.call("PEXPIRE", KEYS[2], ttl_ms)
 return marker
 `;
 
-function parseRecordingV2Activation(raw: string | null): {
-  captureGeneration: number;
-  activatedAt: string;
-} | undefined {
+function parseRecordingV2Activation(raw: string | null): RecordingV2Activation | undefined {
   if (!raw) return undefined;
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;

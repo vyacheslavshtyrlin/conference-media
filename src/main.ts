@@ -174,8 +174,8 @@ async function runShutdown(reason: string): Promise<void> {
     async () => {
         await gateway.stop();
         await botGateway?.stop();
+        await recordingBridge?.stop();
         await roomManager.shutdown();
-        recordingBridge?.stop();
         mediasoup.closeAll();
         await mediaLease.release();
         await closeWebSocketServers();

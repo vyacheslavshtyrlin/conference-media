@@ -116,6 +116,30 @@ describe("RecordingBotSessionManager", () => {
     ]);
   });
 
+  it("replays the latest authority mutation that arrives before the snapshot barrier", async () => {
+    const initial = { participants: [], producers: [] };
+    const next = { participants: [participant("peer_1")], producers: [producer("camera_1", "peer_1")] };
+    let releaseFreeze!: () => void;
+    const freezePending = new Promise<void>((resolve) => { releaseFreeze = resolve; });
+    const context = setup(initial, async (snapshot, accept) => {
+      await freezePending;
+      accept(snapshot);
+    });
+    const events: Array<Record<string, unknown>> = [];
+    context.manager.open(admission, (event) => events.push(event));
+
+    const synchronization = context.manager.syncSnapshot("rec_1");
+    context.manager.syncAuthority("room_1", next);
+    releaseFreeze();
+    await synchronization;
+
+    expect(events.slice(-3)).toEqual([
+      expect.objectContaining({ type: "bot:producerSnapshot", revision: 0, participants: [], producers: [] }),
+      expect.objectContaining({ type: "bot:participantAdded", revision: 1 }),
+      expect.objectContaining({ type: "bot:producerAdded", revision: 2 }),
+    ]);
+  });
+
   it("reconciles with a fresh snapshot before capture and never duplicates a producer consumer", async () => {
     const first = { participants: [participant("peer_1")], producers: [producer("camera_1", "peer_1")] };
     const { manager, media, consumers, setAuthority } = setup(first);
@@ -165,6 +189,25 @@ describe("RecordingBotSessionManager", () => {
     expect(media).not.toHaveProperty("closeRoom");
   });
 
+  it("fences the room without racing the control-plane stop", async () => {
+    const initial = { participants: [participant("peer_1")], producers: [producer("camera_1", "peer_1")] };
+    const { manager, media } = setup(initial);
+    const events: Array<Record<string, unknown>> = [];
+    manager.open(admission, (event) => events.push(event));
+    await manager.createRecvTransport("rec_1");
+    await manager.syncSnapshot("rec_1");
+    await manager.consume("rec_1", "transport_1", "camera_1", {});
+
+    manager.stopRoom("room_1");
+    expect(events).not.toContainEqual(expect.objectContaining({ type: "bot:stop" }));
+    expect(() => manager.closeConsumer("rec_1", "camera_1")).not.toThrow();
+    expect(media.closeBotConsumer).toHaveBeenCalledWith("room_1", expect.any(String), "camera_1");
+    expect(media.closeBotSession).not.toHaveBeenCalled();
+
+    manager.disconnect("rec_1");
+    expect(media.closeBotSession).toHaveBeenCalledTimes(1);
+  });
+
   it("cleans an in-flight old-generation transport if reconnect wins before creation resolves", async () => {
     const { manager, media } = setup();
     let resolveTransport!: (value: { id: string; iceParameters: object; iceCandidates: never[]; dtlsParameters: object }) => void;
@@ -184,21 +227,22 @@ describe("RecordingBotSessionManager", () => {
   it("fences a terminal room before teardown and keeps stale admissions rejected while close-inputs is unresolved", () => {
     let clock = 1_000;
     const { manager, media } = setup({ participants: [participant("peer_1")], producers: [] }, undefined, 100, () => clock);
-    let teardownReopenError: unknown;
-    media.closeBotSession.mockImplementationOnce(() => {
-      try {
-        manager.open({ ...admission, recordingId: "rec_during_teardown", jti: "jti_during" }, () => {});
-      } catch (error) {
-        teardownReopenError = error;
-      }
-    });
     manager.open(admission, () => {});
 
     manager.stopRoom("room_1");
+    let teardownReopenError: unknown;
+    try {
+      manager.open({ ...admission, recordingId: "rec_during_teardown", jti: "jti_during" }, () => {});
+    } catch (error) {
+      teardownReopenError = error;
+    }
     const unresolvedCloseInputs = new Promise<void>(() => {});
     void unresolvedCloseInputs;
 
     expect(teardownReopenError).toBeInstanceOf(Error);
+    expect(media.closeBotSession).not.toHaveBeenCalled();
+    manager.disconnect("rec_1");
+    expect(media.closeBotSession).toHaveBeenCalledTimes(1);
     expect(() => manager.open({ ...admission, recordingId: "rec_stale", jti: "jti_stale" }, () => {}))
       .toThrow("BOT_CAPTURE_INCOMPLETE");
 

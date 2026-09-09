@@ -1,6 +1,6 @@
 ﻿import { afterEach, describe, expect, it } from "vitest";
 
-import { readSignalingConfig } from "./config.js";
+import { readSignalingConfig, resolveBotAnnouncedIp } from "./config.js";
 
 const originalEnv = { ...process.env };
 
@@ -82,6 +82,15 @@ describe("readSignalingConfig", () => {
     });
 
     expect(readSignalingConfig().mediasoup.numWorkers).toBe(3);
+  });
+
+  it("resolves an internal bot ICE address without changing the browser address", () => {
+    expect(resolveBotAnnouncedIp("auto", "127.0.0.1", {
+      lo: [{ address: "127.0.0.1", netmask: "255.0.0.0", family: "IPv4", mac: "00:00:00:00:00:00", internal: true, cidr: "127.0.0.1/8" }],
+      eth0: [{ address: "172.19.0.7", netmask: "255.255.0.0", family: "IPv4", mac: "00:00:00:00:00:01", internal: false, cidr: "172.19.0.7/16" }],
+    })).toBe("172.19.0.7");
+    expect(resolveBotAnnouncedIp(undefined, "203.0.113.12", {})).toBe("203.0.113.12");
+    expect(resolveBotAnnouncedIp("10.0.0.12", "203.0.113.12", {})).toBe("10.0.0.12");
   });
 
   it("reads the node-scoped recording bot admission verifier and caps its TTL at 60 seconds", () => {

@@ -53,7 +53,9 @@ type Attempt = {
   producers: Map<string, BotProducerDescriptor>;
   send: BotSender;
   snapshotSent: boolean;
+  pendingAuthority?: BotAuthoritySnapshot;
   captureStarted: boolean;
+  stopping: boolean;
   stopped: boolean;
 };
 
@@ -95,6 +97,7 @@ export class RecordingBotSessionManager {
       send,
       snapshotSent: false,
       captureStarted: false,
+      stopping: false,
       stopped: false,
     });
     send({ type: "bot:admitted", protocolVersion: RECORDING_BOT_PROTOCOL_VERSION, roomId: payload.roomId, recordingId: payload.recordingId });
@@ -123,7 +126,7 @@ export class RecordingBotSessionManager {
     const attempt = this.require(recordingId, sessionId);
     if (attempt.snapshotSent) return;
     await this.freezeAuthority(attempt.roomId, (frozen) => {
-      if (this.attempts.get(recordingId) !== attempt || attempt.snapshotSent) return;
+      if (this.attempts.get(recordingId) !== attempt || attempt.stopping || attempt.snapshotSent) return;
       attempt.participants = mapParticipants(frozen.participants);
       attempt.producers = mapProducers(frozen.producers);
       attempt.snapshotSent = true;
@@ -135,6 +138,9 @@ export class RecordingBotSessionManager {
         participants: [...attempt.participants.values()],
         producers: [...attempt.producers.values()],
       });
+      const pending = attempt.pendingAuthority;
+      attempt.pendingAuthority = undefined;
+      if (pending) this.reconcileAuthority(attempt, pending);
     });
   }
 
@@ -160,53 +166,60 @@ export class RecordingBotSessionManager {
 
   syncAuthority(roomId: string, snapshot: BotAuthoritySnapshot): void {
     for (const attempt of this.attempts.values()) {
-      if (attempt.roomId !== roomId || attempt.stopped) continue;
-      const nextParticipants = mapParticipants(snapshot.participants);
-      const nextProducers = mapProducers(snapshot.producers);
-
-      for (const [producerId, producer] of attempt.producers) {
-        if (!nextProducers.has(producerId)) this.emit(attempt, "bot:producerClosed", { producerId, participantId: producer.participantId });
+      if (attempt.roomId !== roomId || attempt.stopping || attempt.stopped) continue;
+      if (!attempt.snapshotSent) {
+        attempt.pendingAuthority = cloneAuthority(snapshot);
+        continue;
       }
-      for (const [participantId] of attempt.participants) {
-        if (!nextParticipants.has(participantId)) this.emit(attempt, "bot:participantLeft", { participantId });
-      }
-      for (const [participantId, participant] of nextParticipants) {
-        const previous = attempt.participants.get(participantId);
-        if (!previous) this.emit(attempt, "bot:participantAdded", { participant });
-        else if (previous.displayName !== participant.displayName) this.emit(attempt, "bot:participantUpdated", { participant });
-      }
-      for (const [producerId, producer] of nextProducers) {
-        const previous = attempt.producers.get(producerId);
-        if (!previous) this.emit(attempt, "bot:producerAdded", { producer });
-        else if (descriptorChanged(previous, producer)) this.emit(attempt, "bot:producerUpdated", { producer });
-        else if (previous.paused !== producer.paused) this.emit(attempt, producer.paused ? "bot:producerPaused" : "bot:producerResumed", { producerId, participantId: producer.participantId });
-      }
-      attempt.participants = nextParticipants;
-      attempt.producers = nextProducers;
+      this.reconcileAuthority(attempt, snapshot);
     }
   }
 
   disconnect(recordingId: string, sessionId?: string): void {
     const attempt = this.attempts.get(recordingId);
     if (!attempt || attempt.stopped || (sessionId !== undefined && attempt.sessionId !== sessionId)) return;
+    if (attempt.stopping) {
+      this.closeAttempt(attempt);
+      return;
+    }
     if (attempt.captureStarted) {
       this.failAttempt(attempt);
       return;
     }
-    this.media.closeBotSession(attempt.roomId, attempt.sessionId);
-    attempt.stopped = true;
-    this.attempts.delete(recordingId);
+    this.closeAttempt(attempt);
   }
 
   stopRoom(roomId: string): void {
     this.fenceRoom(roomId);
     for (const attempt of [...this.attempts.values()]) {
-      if (attempt.roomId !== roomId) continue;
-      attempt.stopped = true;
-      attempt.send({ type: "bot:stop", recordingId: attempt.recordingId, revision: attempt.revision });
-      this.media.closeBotSession(roomId, attempt.sessionId);
-      this.attempts.delete(attempt.recordingId);
+      if (attempt.roomId !== roomId || attempt.stopping) continue;
+      attempt.stopping = true;
     }
+  }
+
+  private reconcileAuthority(attempt: Attempt, snapshot: BotAuthoritySnapshot): void {
+    const nextParticipants = mapParticipants(snapshot.participants);
+    const nextProducers = mapProducers(snapshot.producers);
+
+    for (const [producerId, producer] of attempt.producers) {
+      if (!nextProducers.has(producerId)) this.emit(attempt, "bot:producerClosed", { producerId, participantId: producer.participantId });
+    }
+    for (const [participantId] of attempt.participants) {
+      if (!nextParticipants.has(participantId)) this.emit(attempt, "bot:participantLeft", { participantId });
+    }
+    for (const [participantId, participant] of nextParticipants) {
+      const previous = attempt.participants.get(participantId);
+      if (!previous) this.emit(attempt, "bot:participantAdded", { participant });
+      else if (previous.displayName !== participant.displayName) this.emit(attempt, "bot:participantUpdated", { participant });
+    }
+    for (const [producerId, producer] of nextProducers) {
+      const previous = attempt.producers.get(producerId);
+      if (!previous) this.emit(attempt, "bot:producerAdded", { producer });
+      else if (descriptorChanged(previous, producer)) this.emit(attempt, "bot:producerUpdated", { producer });
+      else if (previous.paused !== producer.paused) this.emit(attempt, producer.paused ? "bot:producerPaused" : "bot:producerResumed", { producerId, participantId: producer.participantId });
+    }
+    attempt.participants = nextParticipants;
+    attempt.producers = nextProducers;
   }
 
   private emit(attempt: Attempt, type: string, data: Record<string, unknown>): void {
@@ -235,6 +248,13 @@ export class RecordingBotSessionManager {
     this.attempts.delete(attempt.recordingId);
     this.media.closeBotSession(attempt.roomId, attempt.sessionId);
     this.onRecoveryRequired({ roomId: attempt.roomId, recordingId: attempt.recordingId, code: "BOT_CAPTURE_INCOMPLETE" });
+  }
+
+  private closeAttempt(attempt: Attempt): void {
+    if (this.attempts.get(attempt.recordingId) !== attempt) return;
+    attempt.stopped = true;
+    this.attempts.delete(attempt.recordingId);
+    this.media.closeBotSession(attempt.roomId, attempt.sessionId);
   }
 
   private fenceRoom(roomId: string): void {
@@ -374,6 +394,17 @@ export class RecordingBotSocketGateway {
     if (socket.readyState !== WebSocket.OPEN) return;
     try {
       socket.send(JSON.stringify(event));
+      if (event.type === "bot:producerSnapshot" || event.type === "bot:stop" || event.type.endsWith("Added")) {
+        this.logger?.info("recording bot lifecycle event sent", {
+          operation: "recordingBot.send",
+          eventType: event.type,
+          recordingId: event.recordingId,
+          revision: event.revision,
+          participantCount: Array.isArray(event.participants) ? event.participants.length : undefined,
+          producerCount: Array.isArray(event.producers) ? event.producers.length : undefined,
+          outcome: "ok",
+        });
+      }
     } catch (error) {
       this.logger?.warn("recording bot event delivery failed", {
         operation: "recordingBot.send",
@@ -391,6 +422,13 @@ function mapParticipants(participants: BotParticipantDescriptor[]): Map<string, 
 
 function mapProducers(producers: BotProducerDescriptor[]): Map<string, BotProducerDescriptor> {
   return new Map(producers.map((producer) => [producer.producerId, { ...producer }]));
+}
+
+function cloneAuthority(snapshot: BotAuthoritySnapshot): BotAuthoritySnapshot {
+  return {
+    participants: snapshot.participants.map((participant) => ({ ...participant })),
+    producers: snapshot.producers.map((producer) => ({ ...producer })),
+  };
 }
 
 function descriptorChanged(left: BotProducerDescriptor, right: BotProducerDescriptor): boolean {

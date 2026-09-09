@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { MediasoupService } from "./mediasoupService.js";
 import type { RedisRoomRepository } from "./redisRoomRepository.js";
 import type { RoomRecordingBridge } from "./recordingBridge.js";
-import { RecordingBotSessionManager } from "./recordingBot.js";
+import { RecordingBotSessionManager, type BotAuthoritySnapshot } from "./recordingBot.js";
 import { RoomManager } from "./roomManager.js";
 import type { JoinTokenPayload } from "./token.js";
 
@@ -325,6 +325,39 @@ describe("RoomManager", () => {
     });
     expect(repository.participants.has("peer_1")).toBe(true);
     expect(roomBecameLive).toHaveBeenCalledTimes(3);
+  });
+
+  it("places the joining participant behind the recording snapshot barrier before admitting the room", async () => {
+    const repository = new FakeRepository();
+    repository.room = { ...room, recordingRequested: true };
+    const mediasoup = new FakeMediasoupService();
+    let frozen: BotAuthoritySnapshot | undefined;
+    const managerRef: { current?: RoomManager } = {};
+    const recording: RoomRecordingBridge = {
+      roomBecameLive: vi.fn(async () => {
+        await managerRef.current?.freezeBotAuthoritySnapshot(room.roomId, (snapshot) => { frozen = snapshot; });
+      }),
+      producerAdded: vi.fn().mockResolvedValue(undefined),
+      producerPaused: vi.fn().mockResolvedValue(undefined),
+      producerClosed: vi.fn().mockResolvedValue(undefined),
+      stopRoom: vi.fn().mockResolvedValue(undefined),
+      logFailure: vi.fn(),
+    };
+    const manager = new RoomManager(
+      repository as unknown as RedisRoomRepository,
+      mediasoup as unknown as MediasoupService,
+      60_000,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      recording,
+    );
+    managerRef.current = manager;
+
+    await manager.join(createPayload("peer_1"));
+
+    expect(frozen).toEqual({ participants: [{ participantId: "peer_1", displayName: "peer_1" }], producers: [] });
   });
 
   it("installs the local bot room fence before awaiting a rejected or unresolved close-input dispatch", async () => {

@@ -77,12 +77,14 @@ const mediaCodecs = [
   {
     kind: "audio" as const,
     mimeType: "audio/opus",
+    preferredPayloadType: 111,
     clockRate: 48000,
     channels: 2,
   },
   {
     kind: "video" as const,
     mimeType: "video/VP8",
+    preferredPayloadType: 96,
     clockRate: 90000,
     parameters: {
       "x-google-start-bitrate": 1000,
@@ -91,6 +93,7 @@ const mediaCodecs = [
   {
     kind: "video" as const,
     mimeType: "video/H264",
+    preferredPayloadType: 106,
     clockRate: 90000,
     parameters: {
       "packetization-mode": 1,
@@ -543,7 +546,7 @@ export class MediasoupService {
     }
     if (!session.transportPromise) {
       session.transportPromise = room.router.createWebRtcTransport({
-        listenIps: [{ ip: this.config.listenIp, announcedIp: this.config.announcedIp }],
+        listenIps: [{ ip: this.config.listenIp, announcedIp: this.config.botAnnouncedIp ?? this.config.announcedIp }],
         enableUdp: true,
         enableTcp: true,
         preferTcp: true,

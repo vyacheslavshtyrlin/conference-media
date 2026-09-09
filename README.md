@@ -45,7 +45,7 @@ WebSocket: heartbeat, max payload, backpressure, rate limit, проверка or
 | `RECORDING_CONTROL_URL` | Private API URL с суффиксом `/internal/v1` для control plane записи. |
 | `RECORDING_CONTROL_JWT_HS256_SECRET` | Общий с API секрет signaling → API внутренних recording events. |
 | `RECORDING_BOT_ADMISSION_JWT_HS256_SECRET` | Общий с API секрет выдачи короткоживущих admission для receive-only capture bot. |
-| `RECORDING_BOT_WORKERS_JSON` | JSON-массив capture worker-ов: `workerId`, `controlUrl`, `capacity`. Production registry содержит `recording-worker-1` … `recording-worker-5` с портами `8091` … `8095` и capacity `10` у каждого. |
+| `RECORDING_BOT_WORKERS_JSON` | JSON-массив capture worker-ов: `workerId`, `controlUrl`, `capacity`. Production registry содержит `recording-worker-1` … `recording-worker-5` с HTTPS control URL `https://recorder.victoryspace.ru/workers/1` … `/workers/5` и capacity `10` у каждого. |
 | `RECORDING_BOT_SIGNALING_URL` | WebSocket URL signaling для приватного capture worker: `wss://media.victoryspace.ru/internal/recording-bot/v1`. |
 | `RECORDING_WORKER_LEASE_TTL_MS` / `RECORDING_WORKER_HEARTBEAT_MS` | Lease и heartbeat capacity admission; heartbeat должен быть меньше lease TTL. |
 | `ROOM_EMPTY_GRACE_MS` | Задержка очистки пустой комнаты (по умолчанию `10000`). |
@@ -58,6 +58,7 @@ WebSocket: heartbeat, max payload, backpressure, rate limit, проверка or
 | `WS_ALLOWED_ORIGINS` | Разрешённые browser origins (CSV). |
 | `MEDIASOUP_LISTEN_IP` | IP mediasoup внутри контейнера (по умолчанию `0.0.0.0`). |
 | `MEDIASOUP_ANNOUNCED_IP` | Публичный IP в ICE candidates (обязательный). |
+| `MEDIASOUP_BOT_ANNOUNCED_IP` | IP в ICE candidates приватного recording bot; пустое значение использует публичный IP, `auto` выбирает non-loopback IPv4 контейнера для локального Compose. |
 | `MEDIASOUP_RTC_MIN_PORT` / `MEDIASOUP_RTC_MAX_PORT` | Диапазон RTC-портов (по умолчанию `40000`–`40100`). |
 | `MEDIASOUP_NUM_WORKERS` | Кол-во worker-процессов mediasoup (по умолчанию `2`). |
 | `MEDIASOUP_MAX_TRANSPORTS_PER_PEER` | Лимит transports на участника (по умолчанию `4`). |

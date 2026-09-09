@@ -1,5 +1,5 @@
 ﻿import type { IceServer } from "#contracts";
-import { cpus } from "node:os";
+import { cpus, networkInterfaces, type NetworkInterfaceInfo } from "node:os";
 
 import { readEnv, readNumberEnv } from "./env.js";
 
@@ -26,6 +26,7 @@ export type SignalingConfig = {
     numWorkers: number;
     listenIp: string;
     announcedIp?: string;
+    botAnnouncedIp?: string;
     rtcMinPort: number;
     rtcMaxPort: number;
     maxTransportsPerPeer: number;
@@ -61,6 +62,8 @@ export type ServiceJwtConfig = {
 
 export function readSignalingConfig(): SignalingConfig {
   const announcedIp = process.env.MEDIASOUP_ANNOUNCED_IP;
+  const resolvedAnnouncedIp =
+    announcedIp && announcedIp.length > 0 ? announcedIp : undefined;
   const recording = readRecordingConfig();
   const mediaNodeId = readEnv("MEDIA_NODE_ID", "local");
   const recordingBotAdmission = readRecordingBotAdmissionConfig(mediaNodeId);
@@ -106,8 +109,11 @@ export function readSignalingConfig(): SignalingConfig {
     mediasoup: {
       numWorkers: totalMediasoupWorkers,
       listenIp: readEnv("MEDIASOUP_LISTEN_IP", "0.0.0.0"),
-      announcedIp:
-        announcedIp && announcedIp.length > 0 ? announcedIp : undefined,
+      announcedIp: resolvedAnnouncedIp,
+      botAnnouncedIp: resolveBotAnnouncedIp(
+        process.env.MEDIASOUP_BOT_ANNOUNCED_IP,
+        resolvedAnnouncedIp,
+      ),
       rtcMinPort: readNumberEnv("MEDIASOUP_RTC_MIN_PORT", 40000),
       rtcMaxPort: readNumberEnv("MEDIASOUP_RTC_MAX_PORT", 49999),
       maxTransportsPerPeer: readPositiveNumberEnv(
@@ -133,6 +139,25 @@ export function readSignalingConfig(): SignalingConfig {
 
   validateSignalingConfig(config);
   return config;
+}
+
+export function resolveBotAnnouncedIp(
+  configuredValue: string | undefined,
+  fallback: string | undefined,
+  interfaces: NodeJS.Dict<NetworkInterfaceInfo[]> = networkInterfaces(),
+): string | undefined {
+  const configured = configuredValue?.trim();
+  if (!configured || configured.toLowerCase() !== "auto") {
+    return configured || fallback;
+  }
+
+  for (const addresses of Object.values(interfaces)) {
+    const address = addresses?.find(
+      (candidate) => candidate.family === "IPv4" && !candidate.internal,
+    );
+    if (address) return address.address;
+  }
+  throw new Error("MEDIASOUP_BOT_ANNOUNCED_IP=auto requires a non-loopback IPv4 address");
 }
 
 function readRecordingBotAdmissionConfig(mediaNodeId: string): SignalingConfig["recordingBotAdmission"] {

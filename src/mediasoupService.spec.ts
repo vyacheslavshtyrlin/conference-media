@@ -45,6 +45,7 @@ let consumerCounter = 0;
 let fakeAudioLevelObservers: FakeAudioLevelObserver[] = [];
 let fakeAudioLevelObserverOptions: Array<Record<string, unknown>> = [];
 let fakeTransportConnections: Array<{ ip?: string; port?: number }> = [];
+let fakeTransportOptions: Array<Record<string, unknown>> = [];
 let fakeRouters: unknown[] = [];
 let fakePreferredLayers: Array<{ spatialLayer: number; temporalLayer?: number }> = [];
 let fakeConsumerPaused: boolean[] = [];
@@ -80,7 +81,10 @@ function createFakeRouter(mediaCodecs: Array<Record<string, unknown>>) {
       fakeAudioLevelObserverOptions.push(options);
       return createFakeAudioLevelObserver();
     },
-    createWebRtcTransport: async () => createFakeTransport(),
+    createWebRtcTransport: async (options: Record<string, unknown>) => {
+      fakeTransportOptions.push(options);
+      return createFakeTransport();
+    },
   };
   fakeRouters.push(router);
   return router;
@@ -191,6 +195,7 @@ describe("MediasoupService", () => {
     fakeAudioLevelObservers = [];
     fakeAudioLevelObserverOptions = [];
     fakeTransportConnections = [];
+    fakeTransportOptions = [];
     fakeRouters = [];
     fakePreferredLayers = [];
     fakeConsumerPaused = [];
@@ -220,6 +225,23 @@ describe("MediasoupService", () => {
     expect(createWorker).toHaveBeenCalledTimes(1);
   });
 
+  it("advertises a container-reachable ICE address only to the recording bot", async () => {
+    const service = await createService({
+      announcedIp: "127.0.0.1",
+      botAnnouncedIp: "172.19.0.7",
+    });
+
+    await service.createWebRtcTransport("room_1", "peer_1", "send");
+    await service.createBotRecvTransport("room_1", "rec_1");
+
+    expect(fakeTransportOptions[0]).toMatchObject({
+      listenIps: [{ ip: "127.0.0.1", announcedIp: "127.0.0.1" }],
+    });
+    expect(fakeTransportOptions[1]).toMatchObject({
+      listenIps: [{ ip: "127.0.0.1", announcedIp: "172.19.0.7" }],
+    });
+  });
+
   it("configures active speaker detection to ignore quiet background noise", async () => {
     const service = await createService();
 
@@ -238,11 +260,16 @@ describe("MediasoupService", () => {
     const capabilities = await service.getRouterRtpCapabilities("room_1");
 
     expect(fakeRouterMediaCodecs[0]).toEqual([
-      expect.objectContaining({ kind: "audio", mimeType: "audio/opus", clockRate: 48000 }),
-      expect.objectContaining({ kind: "video", mimeType: "video/VP8", clockRate: 90000 }),
+      expect.objectContaining({
+        kind: "audio", mimeType: "audio/opus", preferredPayloadType: 111, clockRate: 48000,
+      }),
+      expect.objectContaining({
+        kind: "video", mimeType: "video/VP8", preferredPayloadType: 96, clockRate: 90000,
+      }),
       {
         kind: "video",
         mimeType: "video/H264",
+        preferredPayloadType: 106,
         clockRate: 90000,
         parameters: {
           "packetization-mode": 1,
@@ -277,7 +304,7 @@ describe("MediasoupService", () => {
       codecs: [{
         kind: "video",
         mimeType: "video/H264",
-        preferredPayloadType: 102,
+        preferredPayloadType: 106,
         clockRate: 90000,
         parameters: {
           "packetization-mode": 1,
