@@ -8,7 +8,7 @@ const joinTokenPayloadSchema = z.object({
   participantId: z.string().min(1),
   displayName: z.string().trim().min(1).max(80),
   isCreator: z.boolean().default(false),
-  exp: z.number().int().positive().optional(),
+  exp: z.number().int().positive(),
 }).strict();
 
 export type JoinTokenPayload = z.infer<typeof joinTokenPayloadSchema>;
@@ -95,7 +95,7 @@ export function verifyJoinToken(token: string | undefined, secret: string): Join
     throw new SignalingError("INVALID_TOKEN", "Invalid join token payload");
   }
 
-  if (payload.data.exp && payload.data.exp * 1000 <= Date.now()) {
+  if (payload.data.exp <= Math.floor(Date.now() / 1000)) {
     throw new SignalingError("INVALID_TOKEN", "Join token expired");
   }
 

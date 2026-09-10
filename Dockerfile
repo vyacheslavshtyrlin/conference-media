@@ -10,7 +10,7 @@ FROM deps AS dev
 COPY . .
 EXPOSE 4000
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
-  CMD wget -q --spider http://127.0.0.1:4000/health || exit 1
+  CMD wget -q --spider http://127.0.0.1:4000/ready || exit 1
 CMD ["npm", "run", "dev"]
 
 FROM deps AS build
@@ -26,5 +26,5 @@ COPY --from=build /app/package*.json ./
 COPY --from=build /app/dist ./dist
 EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-  CMD wget -q --spider http://127.0.0.1:4000/health || exit 1
+  CMD wget -q --spider http://127.0.0.1:4000/ready || exit 1
 CMD ["npm", "run", "start"]

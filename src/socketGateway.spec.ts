@@ -346,6 +346,7 @@ function joinPayload(participantId: string, displayName: string): JoinTokenPaylo
     participantId,
     displayName,
     isCreator: false,
+    exp: Math.floor(Date.now() / 1000) + 60,
   };
 }
 
@@ -412,6 +413,25 @@ describe("SocketGateway chat protocol", () => {
         createdAt,
       },
     });
+  });
+
+  it("rolls back a join that completes after the socket has already closed", async () => {
+    const roomManager = createRoomManagerMock();
+    const originalJoin = roomManager.join.getMockImplementation()!;
+    let releaseJoin!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseJoin = resolve; });
+    roomManager.join.mockImplementationOnce(async (payload: JoinTokenPayload) => {
+      await gate;
+      return originalJoin(payload);
+    });
+    const { url } = await createTestGateway(roomManager);
+    const client = new WebSocket(`${url}?token=${encodeURIComponent(createJoinToken(joinPayload("peer_cancelled", "Cancelled")))}`);
+    clients.push(client);
+    await waitForOpen(client);
+    await closeClient(client);
+
+    releaseJoin();
+    await vi.waitFor(() => expect(roomManager.leave).toHaveBeenCalledWith(room.roomId, "peer_cancelled"));
   });
 
   it("supersedes an existing socket for the same participant session without leaving the room", async () => {

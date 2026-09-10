@@ -9,6 +9,80 @@ afterEach(() => {
 });
 
 describe("readSignalingConfig", () => {
+  it("rejects short join-token secrets outside the intentional development default", () => {
+    process.env.NODE_ENV = "development";
+    process.env.JOIN_TOKEN_SECRET = "short-secret";
+
+    expect(readSignalingConfig).toThrow("JOIN_TOKEN_SECRET must contain at least 32 bytes");
+  });
+
+  it("rejects placeholder join-token secrets in production", () => {
+    process.env.NODE_ENV = "production";
+
+    for (const secret of [
+      "change-me-for-local-development",
+      "prefix-change_me-suffix-at-least-32-bytes",
+      "replace-with-at-least-32-random-characters",
+      "production-placeholder-secret-at-least-32-bytes",
+      "example-secret-that-is-at-least-32-bytes",
+      "production-local-development-secret-32-bytes",
+    ]) {
+      process.env.JOIN_TOKEN_SECRET = secret;
+      expect(readSignalingConfig).toThrow(
+        "JOIN_TOKEN_SECRET must not use a placeholder or local-development value",
+      );
+    }
+  });
+
+  it("preserves the intentional join-token default in development", () => {
+    process.env.NODE_ENV = "development";
+    delete process.env.JOIN_TOKEN_SECRET;
+
+    expect(readSignalingConfig().joinTokenSecret).toBe("change-me-for-local-development");
+  });
+
+  it("rejects the committed replace-with marker outside production", () => {
+    process.env.NODE_ENV = "development";
+    process.env.JOIN_TOKEN_SECRET = "replace-with-at-least-32-random-characters";
+
+    expect(readSignalingConfig).toThrow(
+      "JOIN_TOKEN_SECRET must not use a placeholder or local-development value",
+    );
+  });
+
+  it("does not reject random secrets that merely contain example", () => {
+    process.env.NODE_ENV = "production";
+    process.env.JOIN_TOKEN_SECRET = "randomexamplevalue-with-at-least-32-bytes";
+
+    expect(readSignalingConfig().joinTokenSecret).toBe(
+      "randomexamplevalue-with-at-least-32-bytes",
+    );
+  });
+
+  it("allows the root-local change-me recording secrets outside production", () => {
+    Object.assign(process.env, {
+      NODE_ENV: "development",
+      RECORDING_CONTROL_URL: "http://api:3000/internal/v1",
+      RECORDING_CONTROL_JWT_HS256_SECRET: "change-me-recording-control-secret-32-bytes",
+      RECORDING_BOT_WORKERS_JSON: JSON.stringify([{ workerId: "worker-a", controlUrl: "http://worker-a:8090", capacity: 1 }]),
+      RECORDING_BOT_SIGNALING_URL: "ws://127.0.0.1:4000/internal/recording-bot/v1",
+      RECORDING_BOT_CONTROL_JWT_HS256_SECRET: "change-me-recording-bot-control-secret-32-bytes",
+      RECORDING_BOT_ADMISSION_JWT_HS256_SECRET: "change-me-recording-bot-admission-secret-32-bytes",
+    });
+
+    expect(readSignalingConfig()).toMatchObject({
+      recording: {
+        controlJwt: { secret: "change-me-recording-control-secret-32-bytes" },
+        bot: {
+          controlJwt: { secret: "change-me-recording-bot-control-secret-32-bytes" },
+        },
+      },
+      recordingBotAdmission: {
+        secret: "change-me-recording-bot-admission-secret-32-bytes",
+      },
+    });
+  });
+
   it("rejects a lease refresh interval that cannot keep the lease alive", () => {
     process.env.MEDIA_LEASE_TTL_MS = "1000";
     process.env.MEDIA_LEASE_REFRESH_MS = "1000";
@@ -67,6 +141,40 @@ describe("readSignalingConfig", () => {
         },
       },
     });
+  });
+
+  it("rejects placeholder recording secrets in production", () => {
+    Object.assign(process.env, {
+      NODE_ENV: "production",
+      JOIN_TOKEN_SECRET: "production-join-token-secret-with-32-bytes",
+      RECORDING_CONTROL_URL: "http://api:3000/internal/v1",
+      RECORDING_CONTROL_JWT_HS256_SECRET: "replace-with-at-least-32-random-characters",
+      RECORDING_BOT_WORKERS_JSON: JSON.stringify([{ workerId: "worker-a", controlUrl: "http://worker-a:8090", capacity: 1 }]),
+      RECORDING_BOT_SIGNALING_URL: "ws://127.0.0.1:4000/internal/recording-bot/v1",
+      RECORDING_BOT_CONTROL_JWT_HS256_SECRET: "production-bot-control-secret-at-least-32-bytes",
+    });
+
+    expect(readSignalingConfig).toThrow(
+      "RECORDING_CONTROL_JWT_HS256_SECRET must not use a placeholder or local-development value",
+    );
+
+    process.env.RECORDING_CONTROL_JWT_HS256_SECRET = "production-recording-control-secret-32-bytes";
+    process.env.RECORDING_BOT_CONTROL_JWT_HS256_SECRET = "replace-with-at-least-32-random-characters";
+    expect(readSignalingConfig).toThrow(
+      "RECORDING_BOT_CONTROL_JWT_HS256_SECRET must not use a placeholder or local-development value",
+    );
+  });
+
+  it("rejects a placeholder bot-admission secret in production", () => {
+    Object.assign(process.env, {
+      NODE_ENV: "production",
+      JOIN_TOKEN_SECRET: "production-join-token-secret-with-32-bytes",
+      RECORDING_BOT_ADMISSION_JWT_HS256_SECRET: "replace-with-at-least-32-random-characters",
+    });
+
+    expect(readSignalingConfig).toThrow(
+      "RECORDING_BOT_ADMISSION_JWT_HS256_SECRET must not use a placeholder or local-development value",
+    );
   });
 
   it("keeps every configured mediasoup worker available for live rooms", () => {

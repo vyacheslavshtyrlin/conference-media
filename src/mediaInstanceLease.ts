@@ -40,6 +40,7 @@ export class MediaInstanceLease {
   private serializedRecord?: string;
   private healthy = false;
   private refreshTimer?: NodeJS.Timeout;
+  private refreshInFlight?: Promise<void>;
   private onLostCallback?: (error: Error) => void;
 
   constructor(
@@ -69,7 +70,7 @@ export class MediaInstanceLease {
     this.serializedRecord = serializedRecord;
     this.healthy = true;
     this.refreshTimer = setInterval(() => {
-      void this.refresh().catch((error: unknown) => this.markLost(toError(error)));
+      this.refreshSafely();
     }, this.refreshMs);
     this.refreshTimer.unref();
     return record;
@@ -88,6 +89,8 @@ export class MediaInstanceLease {
 
   async release(): Promise<void> {
     this.stopRefreshTimer();
+    const pendingRefresh = this.healthy ? this.refreshInFlight : undefined;
+    if (pendingRefresh) await pendingRefresh;
     if (!this.serializedRecord) {
       this.healthy = false;
       return;
@@ -127,6 +130,28 @@ export class MediaInstanceLease {
     this.serializedRecord = nextSerializedRecord;
   }
 
+  private refreshSafely(): void {
+    if (this.refreshInFlight) return;
+    const pending = this.refresh()
+      .catch((error: unknown) => {
+        const leaseExpiresAt = this.record ? Date.parse(this.record.expiresAt) : 0;
+        if (this.healthy && this.now() < leaseExpiresAt && !isDefinitiveLeaseLoss(error)) {
+          this.logger?.warn("media process lease refresh failed transiently", {
+            operation: "mediaLease.refresh",
+            errorCode: "MEDIA_LEASE_REFRESH_FAILED",
+            retrying: true,
+            error: String(error),
+          });
+          return;
+        }
+        this.markLost(toError(error));
+      })
+      .finally(() => {
+        if (this.refreshInFlight === pending) this.refreshInFlight = undefined;
+      });
+    this.refreshInFlight = pending;
+  }
+
   private createRecord(): MediaLeaseRecord {
     const issuedAt = new Date(this.now());
     return {
@@ -161,4 +186,8 @@ export class MediaInstanceLease {
 
 function toError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+function isDefinitiveLeaseLoss(value: unknown): boolean {
+  return value instanceof Error && value.message === "Media process lease was lost";
 }

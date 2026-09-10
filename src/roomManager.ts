@@ -27,6 +27,7 @@ type RuntimeRoomState = {
   metadata: RoomMetadata;
   peers: PeerManager;
   cleanupTimer?: NodeJS.Timeout;
+  recordingLive: boolean;
 };
 
 type CreatorControlResult = {
@@ -77,7 +78,7 @@ export class RoomManager {
     this.recordingBots = manager;
   }
 
-  async join(payload: JoinTokenPayload): Promise<{
+  async join(payload: JoinTokenPayload, signal?: AbortSignal): Promise<{
     room: RoomMetadata;
     participant: Participant;
     participants: Participant[];
@@ -85,26 +86,41 @@ export class RoomManager {
     joinMessage?: ChatMessage;
   }> {
     return this.runExclusive(payload.roomId, async () => {
+      this.assertJoinActive(signal);
       this.assertMediaLeaseHealthy();
-      const roomBeforeJoin = await this.repository.getRoom(payload.roomId);
+      const roomBeforeJoin = await this.awaitJoinOperation(this.repository.getRoom(payload.roomId), signal);
+      this.assertJoinActive(signal);
       const shouldRestoreEmptyTtl = Boolean(roomBeforeJoin.expiresAt);
-      const metadata = await this.repository.touchActiveRoom(roomBeforeJoin);
+      const touchOperation = this.repository.touchActiveRoom(roomBeforeJoin);
+      let metadata: RoomMetadata;
+      try {
+        metadata = await this.awaitJoinOperation(touchOperation, signal);
+      } catch (error) {
+        if (signal?.aborted) this.fenceLateJoinMutation(payload.roomId, payload.participantId, touchOperation);
+        throw error;
+      }
+      this.assertJoinActive(signal);
       const state = await this.ensureRuntimeRoom(metadata);
       state.metadata = metadata;
 
       const alreadyJoined = Boolean(state.peers.getPeer(payload.participantId));
       const isFirstHuman = state.peers.count() === 0 && !alreadyJoined;
       const participant = state.peers.addPeer(payload);
-      if (isFirstHuman && metadata.recordingRequested && this.recording) {
+      if (isFirstHuman && !state.recordingLive && metadata.recordingRequested && this.recording) {
         this.recordingBootstrapSnapshots.set(metadata.roomId, this.buildBotAuthoritySnapshot(metadata.roomId));
         try {
-          await this.recording.roomBecameLive(
+          await this.awaitJoinOperation(this.recording.roomBecameLive(
             metadata,
             state.peers.list(),
             this.mediasoup.listProducers(metadata.roomId),
-          );
+            signal,
+          ), signal);
+          this.assertJoinActive(signal);
+          state.recordingLive = true;
         } catch (error) {
-          const capacityFailure = error instanceof RecordingCapacityError;
+          await this.abortPreparedRecording(metadata.roomId);
+          const joinCancelled = signal?.aborted === true;
+          const capacityFailure = error instanceof RecordingCapacityError || /capacity/i.test(String(error));
           if (shouldRestoreEmptyTtl) {
             state.metadata = await this.repository.markRoomEmpty(state.metadata).catch(() => state.metadata);
           }
@@ -116,10 +132,15 @@ export class RoomManager {
             reason: capacityFailure ? "recording_capacity" : "recording_startup",
           });
           this.recording.logFailure(
-            capacityFailure ? "recording.capacityAdmission" : "recording.startup",
+            joinCancelled
+              ? "recording.joinCancelled"
+              : capacityFailure ? "recording.capacityAdmission" : "recording.startup",
             metadata.roomId,
             error,
           );
+          if (joinCancelled) {
+            throw new SignalingError("MEDIASOUP_ERROR", "Room join timed out or was cancelled");
+          }
           throw new SignalingError(
             "MEDIASOUP_ERROR",
             capacityFailure
@@ -131,6 +152,12 @@ export class RoomManager {
         }
       }
       let participantSaved = false;
+      let participantSaveOperation: Promise<void> | undefined;
+      let participantSaveSettled = false;
+      let ensureRoomOperation: Promise<unknown> | undefined;
+      let ensureRoomSettled = false;
+      let sessionTransition: Promise<void> | undefined;
+      let sessionTransitionSettled = false;
 
       if (state.cleanupTimer) {
         clearTimeout(state.cleanupTimer);
@@ -138,10 +165,38 @@ export class RoomManager {
       }
 
       try {
-        await this.repository.saveParticipant(metadata.roomId, participant, this.getMediaEpoch());
+        participantSaveOperation = this.repository.saveParticipant(
+          metadata.roomId,
+          participant,
+          this.getMediaEpoch(),
+        );
+        await this.awaitJoinOperation(participantSaveOperation, signal);
+        participantSaveSettled = true;
         participantSaved = true;
-        await this.mediasoup.ensureRoom(metadata.roomId);
+        this.assertJoinActive(signal);
+        const pendingRoom = this.mediasoup.ensureRoom(metadata.roomId);
+        ensureRoomOperation = pendingRoom;
+        await this.awaitJoinOperation(pendingRoom, signal);
+        ensureRoomSettled = true;
+        this.assertJoinActive(signal);
+        sessionTransition = this.repository.markRoomSessionLive?.(metadata.roomId, participant.participantId);
+        if (sessionTransition) {
+          await this.awaitJoinOperation(sessionTransition, signal);
+          sessionTransitionSettled = true;
+        }
+        this.assertJoinActive(signal);
       } catch (error) {
+        if (signal?.aborted) {
+          if (participantSaveOperation && !participantSaveSettled) {
+            this.fenceLateJoinMutation(metadata.roomId, participant.participantId, participantSaveOperation);
+          }
+          if (ensureRoomOperation && !ensureRoomSettled) {
+            this.fenceLateJoinMutation(metadata.roomId, participant.participantId, ensureRoomOperation);
+          }
+          if (sessionTransition && !sessionTransitionSettled) {
+            this.fenceLateJoinMutation(metadata.roomId, participant.participantId, sessionTransition);
+          }
+        }
         if (isFirstHuman) {
           await this.abortPreparedRecording(metadata.roomId);
         }
@@ -160,26 +215,44 @@ export class RoomManager {
       let chatMessages: ChatMessage[] = [];
       let joinMessage: ChatMessage | undefined;
       try {
-        chatMessages = await this.repository.listChatMessages(metadata.roomId);
-      } catch (error) {
-        this.logger?.warn("chat history read failed during room join", {
-          operation: "room.join.chatHistory",
-          errorCode: "CHAT_HISTORY_READ_FAILED",
-          roomId: metadata.roomId,
-          participantId: participant.participantId,
-          error: String(error),
-        });
-      }
-      if (!alreadyJoined) {
-        joinMessage = await this.appendSystemChatMessageBestEffort(
-          metadata.roomId,
-          `${participant.displayName} подключился к конференции`,
-          participant.participantId,
-          "join_log",
-        );
-        if (joinMessage) {
-          chatMessages = [...chatMessages, joinMessage].slice(-CHAT_HISTORY_LIMIT);
+        try {
+          chatMessages = await this.awaitJoinOperation(this.repository.listChatMessages(metadata.roomId), signal);
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          this.logger?.warn("chat history read failed during room join", {
+            operation: "room.join.chatHistory",
+            errorCode: "CHAT_HISTORY_READ_FAILED",
+            roomId: metadata.roomId,
+            participantId: participant.participantId,
+            error: String(error),
+          });
         }
+        if (!alreadyJoined) {
+          joinMessage = await this.appendSystemChatMessageBestEffort(
+            metadata.roomId,
+            `${participant.displayName} подключился к конференции`,
+            participant.participantId,
+            "join_log",
+            signal,
+          );
+          if (joinMessage) {
+            chatMessages = [...chatMessages, joinMessage].slice(-CHAT_HISTORY_LIMIT);
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) {
+          if (isFirstHuman) await this.abortPreparedRecording(metadata.roomId);
+          if (!alreadyJoined) {
+            await this.rollbackFailedJoin(
+              metadata.roomId,
+              participant.participantId,
+              state,
+              true,
+              shouldRestoreEmptyTtl,
+            );
+          }
+        }
+        throw error;
       }
 
       this.logger?.info("room join completed", {
@@ -362,6 +435,7 @@ export class RoomManager {
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
       await this.repository.closeRoom(state.metadata, "closed_by_creator");
+      this.history?.report({ type: "room.closed", roomId, reason: "closed_by_creator" });
       this.metrics.recordRoomCleanup({ operation: "creator_close", outcome: "ok", reason: "closed_by_creator" });
       this.logger?.info("room closed by creator", {
         operation: "room.close.creator",
@@ -389,6 +463,12 @@ export class RoomManager {
       this.mediasoup.closePeer(roomId, targetParticipantId);
       state.peers.removePeer(targetParticipantId);
       await this.repository.removeParticipant(roomId, targetParticipantId);
+      this.history?.report({
+        type: "participant.left",
+        roomId,
+        participantId: target.participantId,
+        displayName: target.displayName,
+      });
       this.syncBotAuthority(roomId);
       await this.repository.setRoomSessionCreator(roomId, targetParticipantId, false);
       const chatMessage = await this.appendSystemChatMessageBestEffort(
@@ -537,11 +617,24 @@ export class RoomManager {
 
       if (state.peers.count() === 0) {
         state.metadata = await this.repository.markRoomEmpty(state.metadata);
-        await this.stopRecording(roomId);
         state.cleanupTimer = setTimeout(() => {
-          void this.closeEmptyRoom(roomId);
+          void this.closeEmptyRoom(roomId).catch((error: unknown) => {
+            this.logger?.error("empty room cleanup failed", {
+              operation: "room.empty.cleanup",
+              errorCode: "ROOM_CLEANUP_FAILED",
+              roomId,
+              error: String(error),
+            });
+          });
         }, this.emptyGraceMs);
       }
+
+      this.history?.report({
+        type: "participant.left",
+        roomId,
+        participantId: participant.participantId,
+        displayName: participant.displayName,
+      });
 
       this.logger?.info("room leave completed", {
         operation: "room.leave",
@@ -572,6 +665,7 @@ export class RoomManager {
       try {
         await this.stopRecording(roomId);
         await this.repository.closeRoom(state.metadata, reason);
+        this.history?.report({ type: "room.closed", roomId, reason });
         this.metrics.recordRoomCleanup({ operation: "room_dead", outcome: "ok", reason });
         this.logger?.error("room closed after mediasoup failure", {
           operation: "room.dead.cleanup",
@@ -604,6 +698,7 @@ export class RoomManager {
     const state: RuntimeRoomState = {
       metadata,
       peers: new PeerManager(),
+      recordingLive: false,
     };
     this.rooms.set(metadata.roomId, state);
     return state;
@@ -706,10 +801,12 @@ export class RoomManager {
     text: string,
     participantId: string,
     operation: string,
+    signal?: AbortSignal,
   ): Promise<ChatMessage | undefined> {
     try {
-      return await this.appendSystemChatMessage(roomId, text);
+      return await this.awaitJoinOperation(this.appendSystemChatMessage(roomId, text), signal);
     } catch (error) {
+      if (signal?.aborted) throw error;
       this.logger?.warn("system chat append failed", {
         roomId,
         participantId,
@@ -791,6 +888,7 @@ export class RoomManager {
       await this.stopRecording(roomId);
       this.mediasoup.closeRoom(roomId);
       this.rooms.delete(roomId);
+      this.history?.report({ type: "room.closed", roomId, reason: "empty_timeout" });
       this.metrics.recordRoomCleanup({ operation: "empty_room", outcome: "ok" });
       this.logger?.info("empty room runtime cleaned up", {
         operation: "room.empty.cleanup",
@@ -871,6 +969,8 @@ export class RoomManager {
     if (!this.recording) return;
     try {
       await withTimeout(this.recording.stopRoom(roomId), RECORDING_STOP_DISPATCH_TIMEOUT_MS);
+      const state = this.rooms.get(roomId);
+      if (state) state.recordingLive = false;
     } catch (error) {
       this.recording.logFailure("recording.stop", roomId, error);
     }
@@ -893,6 +993,49 @@ export class RoomManager {
     if (!this.isMediaLeaseHealthy()) {
       throw new SignalingError("MEDIASOUP_ERROR", "Media process lease is unavailable");
     }
+  }
+
+  private assertJoinActive(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+      throw new SignalingError("MEDIASOUP_ERROR", "Room join timed out or was cancelled");
+    }
+  }
+
+  private async awaitJoinOperation<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return operation;
+    this.assertJoinActive(signal);
+    let onAbort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      onAbort = () => reject(new SignalingError("MEDIASOUP_ERROR", "Room join timed out or was cancelled"));
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      return await Promise.race([operation, aborted]);
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+    }
+  }
+
+  private fenceLateJoinMutation(roomId: string, participantId: string, operation: Promise<unknown>): void {
+    void operation.then(() => this.runExclusive(roomId, async () => {
+      const state = this.rooms.get(roomId);
+      if (state?.peers.getPeer(participantId)) return;
+      await this.repository.removeParticipant(roomId, participantId);
+      if (!state || state.peers.count() === 0) {
+        const metadata = state?.metadata ?? await this.repository.getRoom(roomId).catch(() => undefined);
+        if (metadata && !metadata.expiresAt) await this.repository.markRoomEmpty(metadata);
+        this.mediasoup.closeRoom(roomId);
+        this.rooms.delete(roomId);
+      }
+    })).catch((error: unknown) => {
+      this.logger?.warn("late join mutation compensation failed", {
+        operation: "room.join.lateCompensation",
+        errorCode: "JOIN_LATE_COMPENSATION_FAILED",
+        roomId,
+        participantId,
+        error: String(error),
+      });
+    });
   }
 
   private getRoomLock(roomId: string): Mutex {

@@ -23,6 +23,9 @@ export type RedisClient = {
   lTrim(key: string, start: number, stop: number): Promise<string>;
   expire(key: string, seconds: number): Promise<boolean | number>;
   persist(key: string): Promise<boolean | number>;
+  pExpire?(key: string, milliseconds: number): Promise<boolean | number>;
+  sAdd?(key: string, member: string): Promise<number>;
+  sMembers?(key: string): Promise<string[]>;
   del(keys: string | string[]): Promise<number>;
   eval(
     script: string,
@@ -48,6 +51,17 @@ export type RecordingRecoveryContext = {
 export type RecordingV2Activation = {
   captureGeneration: number;
   activatedAt: string;
+};
+
+type RoomSessionRecord = {
+  participantId: string;
+  displayName: string | null;
+  isCreator: boolean;
+  tokenHash: string;
+  createdAt: string;
+  state: "pending" | "live" | "reconnectable";
+  expiresAt: string | null;
+  identity?: unknown;
 };
 
 export class RedisRoomRepository {
@@ -91,7 +105,7 @@ export class RedisRoomRepository {
     await this.recordRedis("persist_room_metadata", () => this.redis.persist(this.roomKey(activeRoom.roomId)));
     await this.recordRedis("persist_room_slug", () => this.redis.persist(this.slugKey(activeRoom.slug)));
     await this.recordRedis("persist_room_chat", () => this.redis.persist(this.chatKey(activeRoom.roomId)));
-    await this.recordRedis("persist_room_sessions", () => this.redis.persist(this.roomSessionsKey(activeRoom.roomId)));
+    await this.recordRedis("persist_room_session_ids", () => this.redis.persist(this.roomSessionIdsKey(activeRoom.roomId)));
     await this.syncIntegrationMappings(activeRoom.roomId, "persist");
 
     return activeRoom;
@@ -107,29 +121,34 @@ export class RedisRoomRepository {
     ));
   }
 
+  async markRoomSessionLive(roomId: string, participantId: string): Promise<void> {
+    const session = await this.getRoomSession(roomId, participantId);
+    if (!session) return;
+    await this.saveCanonicalRoomSession(roomId, {
+      ...session,
+      state: "live",
+      expiresAt: null,
+    }, "persist");
+  }
+
   async setRoomSessionCreator(roomId: string, participantId: string, isCreator: boolean): Promise<void> {
-    const key = this.roomSessionsKey(roomId);
-    const raw = await this.recordRedis("get_room_session", () => this.redis.hGet(key, participantId));
-    if (!raw) {
-      return;
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw) as unknown;
-    } catch {
-      return;
-    }
-
-    if (!isRoomSessionRecord(parsed)) {
-      return;
-    }
-
-    await this.recordRedis("save_room_session", () => this.redis.hSet(key, participantId, JSON.stringify({ ...parsed, isCreator })));
+    const session = await this.getRoomSession(roomId, participantId);
+    if (!session) return;
+    await this.saveCanonicalRoomSession(roomId, { ...session, isCreator }, session.state === "live" ? "persist" : "keepTtl");
   }
 
   async removeParticipant(roomId: string, participantId: string): Promise<void> {
-    await this.recordRedis("remove_participant", () => this.redis.hDel(this.participantsKey(roomId), participantId));
+    const expiresAt = new Date(Date.now() + EMPTY_ROOM_TTL_SECONDS * 1_000).toISOString();
+    const ttlMs = Math.max(1, Date.parse(expiresAt) - Date.now());
+    await this.recordRedis("remove_participant", () => this.redis.eval(REMOVE_PARTICIPANT_SCRIPT, {
+      keys: [
+        this.participantsKey(roomId),
+        this.roomSessionKey(roomId, participantId),
+        this.legacyRoomSessionsKey(roomId),
+        this.roomSessionIdsKey(roomId),
+      ],
+      arguments: [participantId, `room_session_token:`, roomId, expiresAt, String(ttlMs)],
+    }));
   }
 
   async appendChatMessage(roomId: string, message: ChatMessage): Promise<ChatMessage> {
@@ -174,7 +193,7 @@ export class RedisRoomRepository {
     await this.recordRedis("expire_room_metadata", () => this.redis.expire(this.roomKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_slug", () => this.redis.expire(this.slugKey(emptyRoom.slug), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_chat", () => this.redis.expire(this.chatKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
-    await this.recordRedis("expire_room_sessions", () => this.redis.expire(this.roomSessionsKey(emptyRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.transitionRoomSessionsToReconnectable(emptyRoom.roomId, expiresAt);
     await this.syncIntegrationMappings(emptyRoom.roomId, "expire");
     await this.recordRedis("delete_room_participants", () => this.redis.del(this.participantsKey(emptyRoom.roomId)));
 
@@ -195,7 +214,7 @@ export class RedisRoomRepository {
     await this.recordRedis("expire_room_metadata", () => this.redis.expire(this.roomKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_slug", () => this.redis.expire(this.slugKey(closedRoom.slug), EMPTY_ROOM_TTL_SECONDS));
     await this.recordRedis("expire_room_chat", () => this.redis.expire(this.chatKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
-    await this.recordRedis("expire_room_sessions", () => this.redis.expire(this.roomSessionsKey(closedRoom.roomId), EMPTY_ROOM_TTL_SECONDS));
+    await this.transitionRoomSessionsToReconnectable(closedRoom.roomId, expiresAt);
     await this.syncIntegrationMappings(closedRoom.roomId, "expire");
     await this.recordRedis("delete_room_participants", () => this.redis.del(this.participantsKey(closedRoom.roomId)));
 
@@ -319,8 +338,77 @@ export class RedisRoomRepository {
     return `room:${roomId}:chat`;
   }
 
-  private roomSessionsKey(roomId: string): string {
+  private legacyRoomSessionsKey(roomId: string): string {
     return `room:${roomId}:sessions`;
+  }
+
+  private roomSessionKey(roomId: string, participantId: string): string {
+    return `room:${roomId}:session:${participantId}`;
+  }
+
+  private roomSessionIdsKey(roomId: string): string {
+    return `room:${roomId}:session_ids`;
+  }
+
+  private roomSessionTokenIndexKey(tokenHash: string): string {
+    return `room_session_token:${tokenHash}`;
+  }
+
+  private async getRoomSession(roomId: string, participantId: string): Promise<RoomSessionRecord | undefined> {
+    const canonical = await this.recordRedis("get_room_session", () =>
+      this.redis.get(this.roomSessionKey(roomId, participantId)),
+    );
+    const legacy = canonical ?? await this.recordRedis("get_legacy_room_session", () =>
+      this.redis.hGet(this.legacyRoomSessionsKey(roomId), participantId),
+    );
+    if (!legacy) return undefined;
+    try {
+      const value = JSON.parse(legacy) as unknown;
+      if (!isRoomSessionRecord(value)) return undefined;
+      return {
+        ...value,
+        state: value.state ?? "reconnectable",
+        expiresAt: value.expiresAt ?? null,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async saveCanonicalRoomSession(
+    roomId: string,
+    session: RoomSessionRecord,
+    ttl: "persist" | "keepTtl",
+  ): Promise<void> {
+    const sessionKey = this.roomSessionKey(roomId, session.participantId);
+    const indexKey = this.roomSessionTokenIndexKey(session.tokenHash);
+    const fallbackTtlMs = session.expiresAt
+      ? Math.max(1, Date.parse(session.expiresAt) - Date.now())
+      : 0;
+    await this.recordRedis("save_room_session", () => this.redis.eval(SAVE_ROOM_SESSION_SCRIPT, {
+      keys: [sessionKey, indexKey, this.roomSessionIdsKey(roomId), this.legacyRoomSessionsKey(roomId)],
+      arguments: [
+        JSON.stringify(session),
+        JSON.stringify({ roomId, participantId: session.participantId }),
+        session.participantId,
+        ttl === "persist" ? "1" : "0",
+        String(fallbackTtlMs),
+      ],
+    }));
+  }
+
+  private async transitionRoomSessionsToReconnectable(roomId: string, expiresAt: string): Promise<void> {
+    const ttlMs = Math.max(1, Date.parse(expiresAt) - Date.now());
+    await this.recordRedis("expire_room_sessions", () => this.redis.eval(TRANSITION_ROOM_SESSIONS_SCRIPT, {
+      keys: [this.roomSessionIdsKey(roomId), this.legacyRoomSessionsKey(roomId)],
+      arguments: [
+        `room:${roomId}:session:`,
+        "room_session_token:",
+        roomId,
+        expiresAt,
+        String(ttlMs),
+      ],
+    }));
   }
 
   private async syncIntegrationMappings(roomId: string, action: "persist" | "expire"): Promise<void> {
@@ -369,6 +457,76 @@ export class RedisRoomRepository {
     }
   }
 }
+
+const SAVE_ROOM_SESSION_SCRIPT = `
+local session_ttl = redis.call("PTTL", KEYS[1])
+local index_ttl = redis.call("PTTL", KEYS[2])
+redis.call("SET", KEYS[1], ARGV[1])
+redis.call("SET", KEYS[2], ARGV[2])
+redis.call("SADD", KEYS[3], ARGV[3])
+redis.call("HDEL", KEYS[4], ARGV[3])
+if ARGV[4] == "1" then
+  redis.call("PERSIST", KEYS[1])
+  redis.call("PERSIST", KEYS[2])
+else
+  local fallback_ttl = tonumber(ARGV[5])
+  local ttl = fallback_ttl
+  if ttl <= 0 then
+    if session_ttl > 0 and index_ttl > 0 then ttl = math.min(session_ttl, index_ttl)
+    elseif session_ttl > 0 then ttl = session_ttl
+    elseif index_ttl > 0 then ttl = index_ttl end
+  end
+  if ttl > 0 then
+    redis.call("PEXPIRE", KEYS[1], ttl)
+    redis.call("PEXPIRE", KEYS[2], ttl)
+  end
+end
+return 1
+`;
+
+const TRANSITION_ROOM_SESSIONS_SCRIPT = `
+local ids = redis.call("SMEMBERS", KEYS[1])
+local legacy_ids = redis.call("HKEYS", KEYS[2])
+for _, participant_id in ipairs(legacy_ids) do
+  redis.call("SADD", KEYS[1], participant_id)
+  table.insert(ids, participant_id)
+end
+local ttl_ms = tonumber(ARGV[5])
+for _, participant_id in ipairs(ids) do
+  local session_key = ARGV[1] .. participant_id
+  local raw = redis.call("GET", session_key)
+  if not raw then raw = redis.call("HGET", KEYS[2], participant_id) end
+  if raw then
+    local session = cjson.decode(raw)
+    session["state"] = "reconnectable"
+    session["expiresAt"] = ARGV[4]
+    redis.call("SET", session_key, cjson.encode(session), "PX", ttl_ms)
+    local index_key = ARGV[2] .. session["tokenHash"]
+    redis.call("SET", index_key, cjson.encode({ roomId = ARGV[3], participantId = participant_id }), "PX", ttl_ms)
+    redis.call("HDEL", KEYS[2], participant_id)
+  end
+end
+redis.call("DEL", KEYS[2])
+redis.call("PEXPIRE", KEYS[1], ttl_ms)
+return #ids
+`;
+
+const REMOVE_PARTICIPANT_SCRIPT = `
+redis.call("HDEL", KEYS[1], ARGV[1])
+local raw = redis.call("GET", KEYS[2])
+if not raw then raw = redis.call("HGET", KEYS[3], ARGV[1]) end
+if not raw then return 0 end
+local session = cjson.decode(raw)
+session["state"] = "reconnectable"
+session["expiresAt"] = ARGV[4]
+local ttl_ms = tonumber(ARGV[5])
+redis.call("SET", KEYS[2], cjson.encode(session), "PX", ttl_ms)
+local index_key = ARGV[2] .. session["tokenHash"]
+redis.call("SET", index_key, cjson.encode({ roomId = ARGV[3], participantId = ARGV[1] }), "PX", ttl_ms)
+redis.call("SADD", KEYS[4], ARGV[1])
+redis.call("HDEL", KEYS[3], ARGV[1])
+return 1
+`;
 
 const BEGIN_RECORDING_V2_FINALIZATION_SCRIPT = `
 local existing = redis.call("GET", KEYS[2])
@@ -470,6 +628,9 @@ function isRoomSessionRecord(value: unknown): value is {
   isCreator: boolean;
   tokenHash: string;
   createdAt: string;
+  state?: "pending" | "live" | "reconnectable";
+  expiresAt?: string | null;
+  identity?: unknown;
 } {
   if (typeof value !== "object" || value === null) {
     return false;
@@ -484,6 +645,9 @@ function isRoomSessionRecord(value: unknown): value is {
     typeof record.tokenHash === "string" &&
     record.tokenHash.length > 0 &&
     typeof record.createdAt === "string" &&
-    !Number.isNaN(Date.parse(record.createdAt))
+    !Number.isNaN(Date.parse(record.createdAt)) &&
+    (record.state === undefined || record.state === "pending" || record.state === "live" || record.state === "reconnectable") &&
+    (record.expiresAt === undefined || record.expiresAt === null ||
+      (typeof record.expiresAt === "string" && !Number.isNaN(Date.parse(record.expiresAt))))
   );
 }

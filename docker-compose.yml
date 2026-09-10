@@ -14,10 +14,12 @@ services:
     environment:
       NODE_ENV: production
       PORT: 4000
+      MEDIA_NODE_ID: ${MEDIA_NODE_ID:?MEDIA_NODE_ID is required}
       REDIS_URL: ${MEDIA_REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
       JOIN_TOKEN_SECRET: ${JOIN_TOKEN_SECRET:?JOIN_TOKEN_SECRET is required}
       ROOM_EMPTY_GRACE_MS: ${ROOM_EMPTY_GRACE_MS:-10000}
       WS_HEARTBEAT_INTERVAL_MS: ${WS_HEARTBEAT_INTERVAL_MS:-30000}
+      WS_JOIN_TIMEOUT_MS: ${WS_JOIN_TIMEOUT_MS:-15000}
       WS_MAX_PAYLOAD_BYTES: ${WS_MAX_PAYLOAD_BYTES:-65536}
       WS_SEND_BACKPRESSURE_BYTES: ${WS_SEND_BACKPRESSURE_BYTES:-262144}
       WS_RATE_LIMIT_WINDOW_MS: ${WS_RATE_LIMIT_WINDOW_MS:-10000}
@@ -31,7 +33,7 @@ services:
       MEDIASOUP_NUM_WORKERS: ${MEDIASOUP_NUM_WORKERS:-2}
       MEDIASOUP_MAX_TRANSPORTS_PER_PEER: ${MEDIASOUP_MAX_TRANSPORTS_PER_PEER:-4}
       MEDIASOUP_MAX_PRODUCERS_PER_PEER: ${MEDIASOUP_MAX_PRODUCERS_PER_PEER:-3}
-      MEDIASOUP_MAX_CONSUMERS_PER_PEER: ${MEDIASOUP_MAX_CONSUMERS_PER_PEER:-32}
+      MEDIASOUP_MAX_CONSUMERS_PER_PEER: ${MEDIASOUP_MAX_CONSUMERS_PER_PEER:-512}
       TURN_URLS: ${TURN_URLS:?TURN_URLS is required}
       TURN_USERNAME: ${TURN_USERNAME:?TURN_USERNAME is required}
       TURN_PASSWORD: ${TURN_PASSWORD:?TURN_PASSWORD is required}
@@ -49,6 +51,13 @@ services:
       turn:
         condition: service_started
     restart: unless-stopped
+    stop_grace_period: 20s
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:4000/ready"]
+      interval: 15s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -63,6 +72,7 @@ services:
       timeout: 3s
       retries: 20
     restart: unless-stopped
+    stop_grace_period: 10s
 
   turn:
     image: coturn/coturn:4.6-alpine
@@ -80,6 +90,7 @@ services:
       - "${TURN_BIND_ADDR:-0.0.0.0}:3478:3478/tcp"
       - "${TURN_MIN_PORT:-50000}-${TURN_MAX_PORT:-50100}:${TURN_MIN_PORT:-50000}-${TURN_MAX_PORT:-50100}/udp"
     restart: unless-stopped
+    stop_grace_period: 10s
 
   # Создаёт self-signed плейсхолдер до старта gateway, чтобы nginx мог подняться
   # с :443 до того, как Let's Encrypt выпустит настоящий сертификат.
@@ -110,8 +121,9 @@ services:
       init-cert:
         condition: service_completed_successfully
       signaling:
-        condition: service_started
+        condition: service_healthy
     restart: unless-stopped
+    stop_grace_period: 10s
 
   # Выпускает сертификат Let's Encrypt (webroot) и продлевает его по расписанию.
   certbot:

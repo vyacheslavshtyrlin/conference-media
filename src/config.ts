@@ -3,6 +3,12 @@ import { cpus, networkInterfaces, type NetworkInterfaceInfo } from "node:os";
 
 import { readEnv, readNumberEnv } from "./env.js";
 
+const localJoinTokenSecret = "change-me-for-local-development";
+const committedSecretMarkerPattern =
+  /(^|[^a-z0-9])(replace[-_]with|placeholder)($|[^a-z0-9])/i;
+const productionSecretMarkerPattern =
+  /(^|[^a-z0-9])(change[-_]me|example[-_]secret|local[-_]development)($|[^a-z0-9])/i;
+
 export type SignalingConfig = {
   port: number;
   mediaNodeId: string;
@@ -15,6 +21,7 @@ export type SignalingConfig = {
     refreshMs: number;
   };
   websocket: {
+    joinTimeoutMs: number;
     heartbeatIntervalMs: number;
     maxPayloadBytes: number;
     sendBackpressureBytes: number;
@@ -78,7 +85,7 @@ export function readSignalingConfig(): SignalingConfig {
     redisUrl: readEnv("REDIS_URL", "redis://localhost:6379"),
     joinTokenSecret: readEnv(
       "JOIN_TOKEN_SECRET",
-      "change-me-for-local-development",
+      localJoinTokenSecret,
     ),
     roomEmptyGraceMs: readPositiveNumberEnv("ROOM_EMPTY_GRACE_MS", 60_000),
     shutdownTimeoutMs: readPositiveNumberEnv("SHUTDOWN_TIMEOUT_MS", 10_000),
@@ -87,6 +94,7 @@ export function readSignalingConfig(): SignalingConfig {
       refreshMs: readPositiveNumberEnv("MEDIA_LEASE_REFRESH_MS", 5_000),
     },
     websocket: {
+      joinTimeoutMs: readPositiveNumberEnv("WS_JOIN_TIMEOUT_MS", 15_000),
       heartbeatIntervalMs: readPositiveNumberEnv(
         "WS_HEARTBEAT_INTERVAL_MS",
         30_000,
@@ -126,7 +134,7 @@ export function readSignalingConfig(): SignalingConfig {
       ),
       maxConsumersPerPeer: readPositiveNumberEnv(
         "MEDIASOUP_MAX_CONSUMERS_PER_PEER",
-        32,
+        512,
       ),
       iceServers: readIceServers(),
     },
@@ -163,13 +171,14 @@ export function resolveBotAnnouncedIp(
 function readRecordingBotAdmissionConfig(mediaNodeId: string): SignalingConfig["recordingBotAdmission"] {
   const secret = process.env.RECORDING_BOT_ADMISSION_JWT_HS256_SECRET?.trim();
   if (!secret) return undefined;
-  if (Buffer.byteLength(secret, "utf8") < 32) {
-    throw new Error("RECORDING_BOT_ADMISSION_JWT_HS256_SECRET must contain at least 32 bytes");
-  }
+  assertSharedSecret("RECORDING_BOT_ADMISSION_JWT_HS256_SECRET", secret);
   return { issuer: "conference-api", secret, mediaNodeId, maxTtlSeconds: 60 };
 }
 
 export function validateSignalingConfig(config: SignalingConfig): void {
+  assertSharedSecret("JOIN_TOKEN_SECRET", config.joinTokenSecret, {
+    allowLocalDevelopmentDefault: true,
+  });
   assertPort("PORT", config.port);
   assertPort("MEDIASOUP_RTC_MIN_PORT", config.mediasoup.rtcMinPort);
   assertPort("MEDIASOUP_RTC_MAX_PORT", config.mediasoup.rtcMaxPort);
@@ -260,9 +269,7 @@ function readPrivateHttpUrlValue(value: string, name: string): string {
 
 function readServiceJwt(prefix: "RECORDING_CONTROL_JWT" | "RECORDING_BOT_CONTROL_JWT"): ServiceJwtConfig {
   const secret = readEnv(`${prefix}_HS256_SECRET`);
-  if (Buffer.byteLength(secret, "utf8") < 32) {
-    throw new Error(`${prefix}_HS256_SECRET must contain at least 32 bytes`);
-  }
+  assertSharedSecret(`${prefix}_HS256_SECRET`, secret);
 
   if (prefix === "RECORDING_BOT_CONTROL_JWT") {
     return {
@@ -280,6 +287,33 @@ function readServiceJwt(prefix: "RECORDING_CONTROL_JWT" | "RECORDING_BOT_CONTROL
     maxTtlSeconds: 300,
   };
 }
+
+function assertSharedSecret(
+  name: string,
+  secret: string,
+  options: { allowLocalDevelopmentDefault?: boolean } = {},
+): void {
+  const isProduction = process.env.NODE_ENV === "production";
+  if (
+    options.allowLocalDevelopmentDefault &&
+    !isProduction &&
+    secret === localJoinTokenSecret
+  ) {
+    return;
+  }
+
+  if (
+    committedSecretMarkerPattern.test(secret) ||
+    (isProduction && productionSecretMarkerPattern.test(secret))
+  ) {
+    throw new Error(`${name} must not use a placeholder or local-development value`);
+  }
+
+  if (Buffer.byteLength(secret, "utf8") < 32) {
+    throw new Error(`${name} must contain at least 32 bytes`);
+  }
+}
+
 function readPrivateWebSocketUrl(name: string): string {
   const value = readEnv(name);
   try {

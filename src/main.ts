@@ -28,7 +28,15 @@ process.on("unhandledRejection", (reason) => {
   process.exit(1);
 });
 
-const redis = createClient({ url: config.redisUrl });
+const redis = createClient({
+  url: config.redisUrl,
+  socket: {
+    connectTimeout: 5_000,
+    reconnectStrategy: (retries) => Math.min(100 * 2 ** retries, 2_000),
+  },
+  commandsQueueMaxLength: 1_000,
+  disableOfflineQueue: true,
+}).withCommandOptions({ timeout: 5_000 });
 
 redis.on("error", (error) => {
   logger.error("redis error", { operation: "redis.connection", errorCode: "REDIS_ERROR", error: error.message });

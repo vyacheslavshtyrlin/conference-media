@@ -50,7 +50,12 @@ export type RecorderProducer = {
 };
 
 export interface RoomRecordingBridge {
-  roomBecameLive(room: RoomMetadata, participants: Participant[], producers: RecorderProducer[]): Promise<void>;
+  roomBecameLive(
+    room: RoomMetadata,
+    participants: Participant[],
+    producers: RecorderProducer[],
+    signal?: AbortSignal,
+  ): Promise<void>;
   producerAdded(room: RoomMetadata, participant: Participant, producer: RecorderProducer): Promise<void>;
   producerPaused(roomId: string, producerId: string, paused: boolean): Promise<void>;
   producerClosed(roomId: string, producerId: string): Promise<void>;
@@ -308,10 +313,15 @@ export class RecordingBridge implements RoomRecordingBridge {
     }
   }
 
-  async roomBecameLive(room: RoomMetadata, _participants: Participant[], _producers: RecorderProducer[]): Promise<void> {
+  async roomBecameLive(
+    room: RoomMetadata,
+    _participants: Participant[],
+    _producers: RecorderProducer[],
+    signal?: AbortSignal,
+  ): Promise<void> {
     if (this.isBlockedPreLive(room.roomId)) throw new Error("Recording preparation was aborted before the first participant became live");
     if (this.isTerminal(room.roomId)) throw new Error("Recording has already reached its terminal state");
-    return this.runSerialized(room.roomId, () => this.ensureStarted(room));
+    return this.runSerialized(room.roomId, () => this.ensureStarted(room, signal));
   }
 
   async producerAdded(room: RoomMetadata, _participant: Participant, _producer: RecorderProducer): Promise<void> {
@@ -344,8 +354,8 @@ export class RecordingBridge implements RoomRecordingBridge {
   }
 
   async abortPrepared(roomId: string): Promise<void> {
-    if (!this.sessions.has(roomId)) return;
     this.markBlockedPreLive(roomId);
+    if (!this.sessions.has(roomId)) return;
     await this.stopRoom(roomId);
   }
 
@@ -385,18 +395,23 @@ export class RecordingBridge implements RoomRecordingBridge {
     });
   }
 
-  private async ensureStarted(room: RoomMetadata): Promise<void> {
+  private async ensureStarted(room: RoomMetadata, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (this.isTerminal(room.roomId)) return;
     const existing = this.sessions.get(room.roomId);
     if (existing?.startPromise) return existing.startPromise;
     if (existing) return;
 
-    const requested = await this.control.lookup(room.roomId);
+    const requested = signal
+      ? await this.control.lookup(room.roomId, signal)
+      : await this.control.lookup(room.roomId);
+    signal?.throwIfAborted();
+    if (this.isBlockedPreLive(room.roomId) || this.isTerminal(room.roomId)) return;
     if (!requested) return;
     if (requested.status === "finalizing") throw new Error("Recording is already finalizing");
     const session: Session = { room, projection: requested };
     this.sessions.set(room.roomId, session);
-    session.startPromise = this.bindAndStartBot(session);
+    session.startPromise = this.bindAndStartBot(session, signal);
     try {
       await session.startPromise;
     } catch (error) {

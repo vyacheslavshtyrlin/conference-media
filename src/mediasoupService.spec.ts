@@ -53,6 +53,7 @@ let fakeRouterMediaCodecs: Array<Array<Record<string, unknown>>> = [];
 let fakeProducedRtpParameters: Array<Record<string, unknown>> = [];
 let fakeConsumedRtpCapabilities: Array<Record<string, unknown>> = [];
 let fakeCanConsume: (rtpCapabilities: Record<string, unknown>) => boolean = () => true;
+let fakeWebRtcServerOptions: Array<Record<string, unknown>> = [];
 let nextFakeProducerType: FakeProducer["type"] = "simple";
 let fakeConsumeGate: Promise<void> | undefined;
 
@@ -61,6 +62,7 @@ function createFakeWorker() {
     observer: EventEmitter;
     close: () => void;
     createRouter: (options: { mediaCodecs: Array<Record<string, unknown>> }) => Promise<ReturnType<typeof createFakeRouter>>;
+    createWebRtcServer: (options: Record<string, unknown>) => Promise<{ id: string; close: () => void }>;
   };
   worker.observer = new EventEmitter();
   worker.close = () => {
@@ -69,6 +71,10 @@ function createFakeWorker() {
   worker.createRouter = async ({ mediaCodecs }) => {
     fakeRouterMediaCodecs.push(mediaCodecs);
     return createFakeRouter(mediaCodecs);
+  };
+  worker.createWebRtcServer = async (options: Record<string, unknown>) => {
+    fakeWebRtcServerOptions.push(options);
+    return { id: `webrtc_${fakeWebRtcServerOptions.length}`, close: vi.fn() };
   };
   return worker;
 }
@@ -203,6 +209,7 @@ describe("MediasoupService", () => {
     fakeProducedRtpParameters = [];
     fakeConsumedRtpCapabilities = [];
     fakeCanConsume = () => true;
+    fakeWebRtcServerOptions = [];
     nextFakeProducerType = "simple";
     fakeConsumeGate = undefined;
     createWorker.mockImplementation(async () => createFakeWorker());
@@ -234,12 +241,17 @@ describe("MediasoupService", () => {
     await service.createWebRtcTransport("room_1", "peer_1", "send");
     await service.createBotRecvTransport("room_1", "rec_1");
 
-    expect(fakeTransportOptions[0]).toMatchObject({
-      listenIps: [{ ip: "127.0.0.1", announcedIp: "127.0.0.1" }],
-    });
-    expect(fakeTransportOptions[1]).toMatchObject({
-      listenIps: [{ ip: "127.0.0.1", announcedIp: "172.19.0.7" }],
-    });
+    expect(fakeWebRtcServerOptions).toEqual([
+      { listenInfos: [
+        { protocol: "udp", ip: "127.0.0.1", announcedAddress: "127.0.0.1", port: 40000 },
+        { protocol: "tcp", ip: "127.0.0.1", announcedAddress: "127.0.0.1", port: 40000 },
+      ] },
+      { listenInfos: [
+        { protocol: "udp", ip: "127.0.0.1", announcedAddress: "172.19.0.7", port: 40001 },
+        { protocol: "tcp", ip: "127.0.0.1", announcedAddress: "172.19.0.7", port: 40001 },
+      ] },
+    ]);
+    expect(fakeTransportOptions[0]?.webRtcServer).not.toBe(fakeTransportOptions[1]?.webRtcServer);
   });
 
   it("configures active speaker detection to ignore quiet background noise", async () => {
@@ -386,6 +398,18 @@ describe("MediasoupService", () => {
     service.closePeer("room_1", "peer_1");
 
     expect(service.getRuntimeStats()).toMatchObject({ producers: 0, consumers: 0 });
+  });
+
+  it("selects the highest simulcast layer when creating a video consumer", async () => {
+    const service = await createService();
+    const sendTransport = await service.createWebRtcTransport("room_1", "peer_1", "send");
+    const recvTransport = await service.createWebRtcTransport("room_1", "peer_2", "recv");
+    nextFakeProducerType = "simulcast";
+    const producer = await service.produce("room_1", "peer_1", sendTransport.id, "video", {}, "camera", () => {});
+
+    await service.consume("room_1", "peer_2", recvTransport.id, producer.id, {});
+
+    expect(fakePreferredLayers).toEqual([{ spatialLayer: 2, temporalLayer: 2 }]);
   });
 
   it("keeps participant consume idempotent for repeated and concurrent requests", async () => {

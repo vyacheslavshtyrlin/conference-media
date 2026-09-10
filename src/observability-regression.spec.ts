@@ -196,15 +196,17 @@ describe("E5-T6B media observability regression suite", () => {
   });
 });
 
-function createFakeWorker(): EventEmitter & { close: () => void; createRouter: () => Promise<never> } {
+function createFakeWorker(): EventEmitter & { close: () => void; createRouter: () => Promise<never>; createWebRtcServer: () => Promise<{ close: () => void }> } {
   const worker = new EventEmitter() as EventEmitter & {
     close: () => void;
     createRouter: () => Promise<never>;
+    createWebRtcServer: () => Promise<{ close: () => void }>;
   };
   worker.close = () => undefined;
   worker.createRouter = async () => {
     throw new Error("not needed for this regression test");
   };
+  worker.createWebRtcServer = async () => ({ close: () => undefined });
   return worker;
 }
 

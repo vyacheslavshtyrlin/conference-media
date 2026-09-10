@@ -8,9 +8,10 @@ const OUTBOX_KEY = "integration_room_history:outbox";
 export class RoomHistoryBridge {
   private timer?: NodeJS.Timeout;
   constructor(private readonly redis: RedisOutbox, private readonly baseUrl: string, private readonly jwt: ServiceJwtConfig) {}
-  start(): void { this.timer = setInterval(() => void this.flush(), 2_000); void this.flush(); }
+  start(): void { this.timer = setInterval(() => this.flushSafely(), 2_000); this.flushSafely(); }
   stop(): void { if (this.timer) clearInterval(this.timer); }
-  report(event: Omit<RoomHistoryEvent, "eventId" | "occurredAt">): void { void this.send({ ...event, eventId: `evt_${randomUUID()}`, occurredAt: new Date().toISOString() }).catch(() => this.enqueue({ ...event, eventId: `evt_${randomUUID()}`, occurredAt: new Date().toISOString() })); }
+  report(event: Omit<RoomHistoryEvent, "eventId" | "occurredAt">): void { const envelope = { ...event, eventId: `evt_${randomUUID()}`, occurredAt: new Date().toISOString() }; void this.send(envelope).catch(() => this.enqueue(envelope).catch(() => undefined)); }
+  private flushSafely(): void { void this.flush().catch(() => undefined); }
   private async enqueue(event: RoomHistoryEvent): Promise<void> { await this.redis.rPush(OUTBOX_KEY, JSON.stringify(event)); await this.redis.expire(OUTBOX_KEY, 30 * 86_400); }
   private async flush(): Promise<void> { for (;;) { const raw = await this.redis.lPop(OUTBOX_KEY); if (!raw) return; let event: RoomHistoryEvent; try { event = JSON.parse(raw) as RoomHistoryEvent; } catch { continue; } try { await this.send(event); } catch { await this.redis.rPush(OUTBOX_KEY, raw); return; } } }
   private async send(event: RoomHistoryEvent): Promise<void> { const response = await fetch(`${this.baseUrl}/room-history/events`, { method: "POST", headers: { authorization: `Bearer ${jwt(this.jwt)}`, "content-type": "application/json" }, body: JSON.stringify(event), signal: AbortSignal.timeout(5_000) }); if (!response.ok) throw new Error(`history event delivery failed: ${response.status}`); }

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { Participant, RoomMetadata } from "#contracts";
 
 import { HttpRecordingBot, HttpRecordingControl, RecordingBridge } from "./recordingBridge.js";
+import { RecordingWorkerPool } from "./recordingWorkerPool.js";
 import type {
   RecordingRecoveryContext,
   RecordingV2Activation,
@@ -90,7 +91,14 @@ function harness() {
     })),
   };
   return {
-    bridge: new RecordingBridge(control, bot, finalizationStore, config),
+    bridge: new RecordingBridge(
+      control,
+      bot,
+      finalizationStore,
+      config,
+      undefined,
+      new RecordingWorkerPool(config.bot.workers, config.bot.workerLeaseTtlMs, Date.now, true),
+    ),
     control,
     bot,
     finalizationStore,
@@ -337,6 +345,24 @@ describe("RecordingBridge", () => {
     await bridge.abortPrepared(room.roomId);
 
     expect(control.closeInputs).toHaveBeenCalledTimes(1);
+    await expect(bridge.roomBecameLive(room, [participant], []))
+      .rejects.toThrow("aborted before the first participant");
+  });
+
+  it("does not start a bot when preparation is aborted while lookup is pending", async () => {
+    const { bridge, control, bot } = harness();
+    let resolveLookup: ((value: Awaited<ReturnType<typeof control.lookup>>) => void) | undefined;
+    control.lookup.mockImplementationOnce(() => new Promise((resolve) => { resolveLookup = resolve; }));
+    const preparation = bridge.roomBecameLive(room, [participant], []);
+    await vi.waitFor(() => expect(control.lookup).toHaveBeenCalledOnce());
+
+    await bridge.abortPrepared(room.roomId);
+    resolveLookup?.({
+      recordingTray: undefined,
+    } as never);
+    await preparation;
+
+    expect(bot.create).not.toHaveBeenCalled();
     await expect(bridge.roomBecameLive(room, [participant], []))
       .rejects.toThrow("aborted before the first participant");
   });

@@ -4,6 +4,9 @@ import { MEDIA_LEASE_KEY, MediaInstanceLease } from "./mediaInstanceLease.js";
 
 class FakeRedisLeaseClient {
   value?: string;
+  evalError?: Error;
+  evalDelay?: Promise<void>;
+  evalCalls = 0;
 
   async set(_key: string, value: string, options: { NX?: boolean }): Promise<string | null> {
     if (options.NX && this.value) {
@@ -14,6 +17,9 @@ class FakeRedisLeaseClient {
   }
 
   async eval(_script: string, options: { arguments: string[] }): Promise<number> {
+    this.evalCalls += 1;
+    if (this.evalDelay) await this.evalDelay;
+    if (this.evalError) throw this.evalError;
     if (options.arguments.length === 1) {
       if (this.value === options.arguments[0]) {
         this.value = undefined;
@@ -71,5 +77,41 @@ describe("MediaInstanceLease", () => {
     now = 1_000;
 
     expect(lease.isHealthy()).toBe(false);
+  });
+
+  it("tolerates transient refresh errors until the locally known TTL expires", async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedisLeaseClient();
+    let now = 0;
+    const lease = new MediaInstanceLease(redis, 1_000, 100, undefined, () => now);
+    const onLost = vi.fn();
+    lease.setLostCallback(onLost);
+    await lease.acquire();
+    redis.evalError = new Error("temporary redis outage");
+
+    now = 100;
+    await vi.advanceTimersByTimeAsync(100);
+    expect(lease.isHealthy()).toBe(true);
+    expect(onLost).not.toHaveBeenCalled();
+
+    now = 1_000;
+    await vi.advanceTimersByTimeAsync(900);
+    expect(lease.isHealthy()).toBe(false);
+    expect(onLost).toHaveBeenCalledOnce();
+  });
+
+  it("does not overlap slow refresh commands", async () => {
+    vi.useFakeTimers();
+    const redis = new FakeRedisLeaseClient();
+    let release!: () => void;
+    redis.evalDelay = new Promise<void>((resolve) => { release = resolve; });
+    const lease = new MediaInstanceLease(redis, 1_000, 100);
+    await lease.acquire();
+
+    await vi.advanceTimersByTimeAsync(300);
+    expect(redis.evalCalls).toBe(1);
+    release();
+    await vi.runOnlyPendingTimersAsync();
+    await lease.release();
   });
 });

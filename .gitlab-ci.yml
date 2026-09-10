@@ -45,13 +45,13 @@ deploy:
     url: $PROD_URL
   script:
     - |
-      if [ -n "$DEPLOY_ENV_PROD" ] && [ -f "$DEPLOY_ENV_PROD" ]; then
-        cp -f "$DEPLOY_ENV_PROD" .env
-      else
-        cp -f .env.example .env
+      deploy_env_prod="${DEPLOY_ENV_PROD:-}"
+      if [ -z "$deploy_env_prod" ] || [ ! -f "$deploy_env_prod" ] || [ ! -s "$deploy_env_prod" ]; then
+        echo "DEPLOY_ENV_PROD must be a non-empty GitLab file variable"
+        exit 1
       fi
-    - export ${IMAGE_ENV_VAR}="conference-${CI_PROJECT_NAME}:latest"
-    - docker compose -f docker-compose.yml up -d --no-build --remove-orphans
+    - export ${IMAGE_ENV_VAR}="conference-${CI_PROJECT_NAME}:${CI_COMMIT_SHORT_SHA}"
+    - docker compose --env-file "$DEPLOY_ENV_PROD" -f docker-compose.yml up -d --no-build --remove-orphans
   rules:
     - if: '$CI_COMMIT_BRANCH == $DEPLOY_BRANCH'
 

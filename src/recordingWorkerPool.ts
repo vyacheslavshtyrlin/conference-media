@@ -67,6 +67,7 @@ export class RecordingWorkerPool {
     descriptors: RecordingWorkerDescriptor[],
     private readonly leaseTtlMs: number,
     private readonly now: () => number = Date.now,
+    initiallyHealthy = false,
   ) {
     for (const descriptor of descriptors) {
       this.validateDescriptor(descriptor);
@@ -74,7 +75,7 @@ export class RecordingWorkerPool {
         ...descriptor,
         generationId: randomUUID(),
         occupiedSlots: 0,
-        leaseExpiresAt: 0,
+        leaseExpiresAt: initiallyHealthy ? this.now() + this.leaseTtlMs : 0,
       });
     }
   }

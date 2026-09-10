@@ -31,6 +31,41 @@ describe("verifyJoinToken", () => {
     });
   });
 
+  it("rejects a join token without exp", () => {
+    const token = createJoinToken({
+      roomId: "room_1",
+      participantId: "peer_1",
+      displayName: "Trusted Participant",
+      isCreator: false,
+    });
+
+    expect(() => verifyJoinToken(token, secret)).toThrow("Invalid join token payload");
+  });
+
+  it("rejects an expired join token", () => {
+    const token = createJoinToken({
+      roomId: "room_1",
+      participantId: "peer_1",
+      displayName: "Trusted Participant",
+      isCreator: false,
+      exp: Math.floor(Date.now() / 1000),
+    });
+
+    expect(() => verifyJoinToken(token, secret)).toThrow("Join token expired");
+  });
+
+  it.each([0, -1, 1.5, "1780401900"])("rejects malformed exp %j", (exp) => {
+    const token = createJoinToken({
+      roomId: "room_1",
+      participantId: "peer_1",
+      displayName: "Trusted Participant",
+      isCreator: false,
+      exp,
+    });
+
+    expect(() => verifyJoinToken(token, secret)).toThrow("Invalid join token payload");
+  });
+
   it.each([
     ["externalSubject", "crm-user-42"],
     ["identity", { source: "integration_admission" }],

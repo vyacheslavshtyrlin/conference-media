@@ -11,6 +11,7 @@ import type {
   Router,
   Transport,
   WebRtcTransport,
+  WebRtcServer,
   Worker,
 } from "mediasoup/types";
 
@@ -109,6 +110,7 @@ const ACTIVE_SPEAKER_INTERVAL_MS = 800;
 export class MediasoupService {
   private readonly rooms = new Map<string, RuntimeRoom>();
   private workers: Array<Worker | undefined> = [];
+  private webRtcServers: Array<{ browser: WebRtcServer; bot: WebRtcServer } | undefined> = [];
   private nextWorkerIndex = 0;
   private closing = false;
   private onRoomDeadCallback?: (roomId: string, reason: RoomClosedReason) => void;
@@ -132,6 +134,7 @@ export class MediasoupService {
     const count = this.config.numWorkers;
     this.closing = false;
     this.workers = Array.from({ length: count });
+    this.webRtcServers = Array.from({ length: count });
     await Promise.all(Array.from({ length: count }, (_, index) => this.createWorkerAt(index)));
     this.logger?.info("mediasoup worker pool ready", {
       operation: "mediasoup.workerPool.init",
@@ -150,6 +153,7 @@ export class MediasoupService {
       worker?.close();
     }
     this.workers = [];
+    this.webRtcServers = [];
   }
 
   async ensureRoom(roomId: string): Promise<RuntimeRoom> {
@@ -226,13 +230,10 @@ export class MediasoupService {
       "Peer transport limit reached",
     );
 
+    const webRtcServer = this.webRtcServers[room.workerIndex]?.browser;
+    if (!webRtcServer) throw new SignalingError("MEDIASOUP_ERROR", "WebRTC server is unavailable");
     const transport = await room.router.createWebRtcTransport({
-      listenIps: [
-        {
-          ip: this.config.listenIp,
-          announcedIp: this.config.announcedIp,
-        },
-      ],
+      webRtcServer,
       enableUdp: true,
       enableTcp: true,
       preferTcp: true,
@@ -477,6 +478,19 @@ export class MediasoupService {
       rtpCapabilities: rtpCapabilities as RtpCapabilities,
       paused: false,
     });
+    if (consumer.kind === "video" && producerRecord.producer.type === "simulcast") {
+      try {
+        await consumer.setPreferredLayers({ spatialLayer: 2, temporalLayer: 2 });
+      } catch (error) {
+        this.logger?.warn("mediasoup consumer preferred layers were not applied", {
+          operation: "mediasoup.consumer.preferredLayers",
+          roomId,
+          participantId,
+          producerId,
+          error: String(error),
+        });
+      }
+    }
     if (
       this.rooms.get(roomId) !== room ||
       room.transports.get(transportId) !== transportRecord ||
@@ -545,8 +559,10 @@ export class MediasoupService {
       return this.describeWebRtcTransport(session.transport);
     }
     if (!session.transportPromise) {
+      const webRtcServer = this.webRtcServers[room.workerIndex]?.bot;
+      if (!webRtcServer) throw new SignalingError("MEDIASOUP_ERROR", "Bot WebRTC server is unavailable");
       session.transportPromise = room.router.createWebRtcTransport({
-        listenIps: [{ ip: this.config.listenIp, announcedIp: this.config.botAnnouncedIp ?? this.config.announcedIp }],
+        webRtcServer,
         enableUdp: true,
         enableTcp: true,
         preferTcp: true,
@@ -999,17 +1015,31 @@ export class MediasoupService {
   }
 
   private async createWorkerAt(index: number): Promise<void> {
+    let worker: Worker | undefined;
     try {
-      const worker = await mediasoup.createWorker({
+      worker = await mediasoup.createWorker({
         rtcMinPort: this.config.rtcMinPort,
         rtcMaxPort: this.config.rtcMaxPort,
       });
+      const browserPort = this.config.rtcMinPort + index * 2;
+      const browser = await worker.createWebRtcServer({
+        listenInfos: this.createWebRtcServerListenInfos(browserPort, this.config.announcedIp),
+      });
+      const botAnnouncedIp = this.config.botAnnouncedIp ?? this.config.announcedIp;
+      const bot = botAnnouncedIp === this.config.announcedIp
+        ? browser
+        : await worker.createWebRtcServer({
+            listenInfos: this.createWebRtcServerListenInfos(browserPort + 1, botAnnouncedIp),
+          });
       worker.on("died", (error) => {
-        void this.handleWorkerDeath(index, worker, error);
+        void this.handleWorkerDeath(index, worker!, error);
       });
       this.workers[index] = worker;
+      this.webRtcServers[index] = { browser, bot };
     } catch (error) {
+      worker?.close();
       this.workers[index] = undefined;
+      this.webRtcServers[index] = undefined;
       this.logger?.error("mediasoup worker replacement failed", {
         operation: "mediasoup.worker.replace",
         errorCode: "MEDIASOUP_WORKER_REPLACEMENT_FAILED",
@@ -1032,6 +1062,7 @@ export class MediasoupService {
       error: String(error),
     });
     this.workers[index] = undefined;
+    this.webRtcServers[index] = undefined;
     for (const [roomId, room] of [...this.rooms.entries()]) {
       if (room.workerIndex === index) {
         this.closeDeadRoom(roomId, "media_server_error");
@@ -1066,6 +1097,18 @@ export class MediasoupService {
   }
 
   private getUsableWorkerCount(): number {
-    return this.workers.filter((worker) => worker !== undefined).length;
+    return this.workers.filter((worker, index) => worker !== undefined && this.webRtcServers[index] !== undefined).length;
+  }
+
+  private createWebRtcServerListenInfos(port: number, announcedAddress?: string) {
+    if (port > this.config.rtcMaxPort) {
+      throw new Error("MEDIASOUP_RTC port range is too small for the configured worker pool");
+    }
+    return (["udp", "tcp"] as const).map((protocol) => ({
+      protocol,
+      ip: this.config.listenIp,
+      announcedAddress,
+      port,
+    }));
   }
 }

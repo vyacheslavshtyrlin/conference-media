@@ -16,6 +16,7 @@ import type { RoomManager } from "./roomManager.js";
 import { verifyJoinToken } from "./token.js";
 
 type WebSocketRuntimeConfig = {
+  joinTimeoutMs?: number;
   heartbeatIntervalMs: number;
   sendBackpressureBytes: number;
   rateLimitWindowMs: number;
@@ -28,6 +29,7 @@ type ClientContext = {
   roomId: string;
   participantId: string;
   joined: boolean;
+  joinAbortController: AbortController;
   isAlive: boolean;
   disconnectMetricRecorded: boolean;
   rateLimit: {
@@ -111,6 +113,7 @@ export class SocketGateway {
         roomId: payload.roomId,
         participantId: payload.participantId,
         joined: false,
+        joinAbortController: new AbortController(),
         isAlive: true,
         disconnectMetricRecorded: false,
         rateLimit: {
@@ -127,6 +130,7 @@ export class SocketGateway {
         void this.handleMessage(context, raw);
       });
       socket.on("close", () => {
+        context.joinAbortController.abort();
         void this.handleDisconnect(context).catch((error: unknown) => {
           this.logger.warn("websocket disconnect cleanup failed", {
             operation: "websocket.disconnect",
@@ -147,7 +151,16 @@ export class SocketGateway {
         });
       });
 
-      await this.joinRoom(context, payload);
+      const joinTimeout = setTimeout(
+        () => context.joinAbortController.abort(),
+        this.config.joinTimeoutMs ?? 15_000,
+      );
+      joinTimeout.unref();
+      try {
+        await this.joinRoom(context, payload);
+      } finally {
+        clearTimeout(joinTimeout);
+      }
       this.logger.info("websocket connection accepted", {
         operation: "websocket.connect",
         durationMs: Date.now() - startedAt,
@@ -568,7 +581,18 @@ export class SocketGateway {
   }
 
   private async joinRoom(context: ClientContext, payload: Parameters<typeof this.roomManager.join>[0]): Promise<void> {
-    const { room, participant, participants, chatMessages, joinMessage } = await this.roomManager.join(payload);
+    const { room, participant, participants, chatMessages, joinMessage } = await this.roomManager.join(
+      payload,
+      context.joinAbortController.signal,
+    );
+    if (
+      context.joinAbortController.signal.aborted ||
+      context.socket.readyState !== WebSocket.OPEN ||
+      this.clients.get(context.socket) !== context
+    ) {
+      await this.roomManager.leave(context.roomId, context.participantId);
+      throw new SignalingError("MEDIASOUP_ERROR", "Room join was cancelled");
+    }
     context.joined = true;
     const releasedParticipant = await this.replaceParticipantSocket(context);
     if (releasedParticipant) {
